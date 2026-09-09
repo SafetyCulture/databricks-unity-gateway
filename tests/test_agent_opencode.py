@@ -179,7 +179,7 @@ class TestRenderOverlay:
         overlay, _ = opencode.render_overlay("system.ai.glm-5-2", "tok", _base_urls(), models)
         glm = overlay["provider"]["databricks-oss"]["models"]["system.ai.glm-5-2"]
         # OpenCode's schema requires both context and output on `limit`.
-        assert glm["limit"] == {"context": 200000, "output": 25000}
+        assert glm["limit"] == {"context": 1000000, "output": 65536}
 
     def test_unknown_oss_family_has_no_output_cap(self):
         # kimi-k2-7-code now has a known limit (see docs/superpowers/plans/

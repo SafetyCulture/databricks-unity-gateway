@@ -1573,30 +1573,37 @@ def classify_model_family(model_id: str) -> str | None:
     return None
 
 
-# Per-family token limits (context window + max output tokens). These are a
-# property of the model + its `/ai-gateway/mlflow/v1` route (the gateway rejects
-# requests whose output exceeds the cap), not of any one agent — so every agent
-# that serves OSS models reads this single table and translates it into its own
-# config dialect. Both fields are provided because agents like OpenCode require
-# context and output together. Keyed by family substring; add an entry to bound
-# a new model.
+# Per-family token limits (context window + max output tokens), keyed by model-id
+# substring. The gateway 400s a request whose max_tokens exceeds its cap, and
+# Claude Code has no way to discover a Databricks model's real context window, so
+# both numbers have to come from probing the gateway rather than an API.
+#
+# This table is shared across agents that serve OSS models (each translates limits
+# into its own config dialect). Both fields are required because agents like
+# OpenCode need context and output together on every model.
+#
+# Values are workspace-specific: the same model can have a different cap on a
+# different Databricks account. Every entry below was measured directly against
+# safetyculture-safetyculture-production — do not copy caps from another
+# workspace's ucode fork or PR without reprobing here first (see the glm/qwen/
+# gpt-oss/llama/gemma caveat below).
 _MODEL_TOKEN_LIMITS: dict[str, dict[str, int]] = {
-    # Every `output` here is the gateway's cap, which sits below the model's
-    # native output length. Neither the model-services listing nor the
-    # serving-endpoints API reports the cap, so it cannot be discovered.
-    #
-    # "kimi" carried over from a 2026-07-16 probe (github.com/lukecameron/ucode,
-    # commit c4df5b1) rather than the 2026-08-31 probe the rest of this table
-    # comes from (PR databricks/unity-gateway#420). Treat it as unverified: the
-    # two probes disagree on overlapping families (e.g. glm output was measured
-    # at 65_536 in the July probe vs 25_000 here), so the gateway's caps have
-    # moved at least once. Re-probe kimi against the live gateway before
-    # trusting this number; drop the entry if `output` turns out to be wrong in
-    # the direction that undercounts (a too-high cap here means a request that
-    # should have been rejected client-side 400s at the gateway instead — the
-    # same failure mode this table exists to prevent).
+    # glm and kimi/kimi-k3/inkling: probed against safetyculture-safetyculture-production
+    # twice, independently, by tripping the gateway's max_tokens rejection —
+    # lukecameron/ucode@fix/oss-serving-endpoints-fallback (2026-07-16) and
+    # SafetyCulture/experimental#474 (2026-08-05, GLM) / #478 (2026-08-11, Kimi K3).
+    # Context windows for glm and kimi-k3 come from each endpoint's own description
+    # ("supports a context length of 1M tokens"), not a guess.
+    "kimi-k3": {"context": 1_000_000, "output": 65_536},
     "kimi": {"context": 128_000, "output": 65_536},
-    "glm": {"context": 200_000, "output": 25_000},
+    "glm": {"context": 1_000_000, "output": 65_536},
+    "inkling": {"context": 128_000, "output": 65_536},
+    # qwen/gpt-oss/llama-4-maverick/gemma: from databricks/unity-gateway#420, which
+    # tested a workspace other than ours. None of these families have been seen on
+    # safetyculture-safetyculture-production as of 2026-09-09 (discover_oss_models
+    # has never returned one) — kept as a same-cohort placeholder so a family isn't
+    # left with no limit at all if one of these models is later added here, but
+    # reprobe before trusting the number if that happens.
     "qwen": {"context": 262_144, "output": 25_000},
     "gpt-oss": {"context": 131_072, "output": 25_000},
     # Keyed on the full name, not `llama`: the Llama 3 endpoints have a 128k
@@ -1609,11 +1616,13 @@ _MODEL_TOKEN_LIMITS: dict[str, dict[str, int]] = {
 def model_token_limits(model_id: str) -> dict[str, int] | None:
     """Return ``{"context": ..., "output": ...}`` limits for ``model_id``, or None.
 
-    Matches by family substring (e.g. any ``*glm*`` id). None means the model
+    Matches by family substring (e.g. any ``*glm*`` id), longest key first so a
+    more specific entry (``kimi-k3``) wins over a shorter one that would otherwise
+    also match (``kimi``) regardless of dict insertion order. None means the model
     has no known limits and the agent should not pin any."""
-    for family, limits in _MODEL_TOKEN_LIMITS.items():
+    for family in sorted(_MODEL_TOKEN_LIMITS, key=len, reverse=True):
         if family in model_id:
-            return dict(limits)
+            return dict(_MODEL_TOKEN_LIMITS[family])
     return None
 
 

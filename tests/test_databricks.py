@@ -248,14 +248,14 @@ def _model_service(model_id: str) -> dict:
 class TestModelTokenLimits:
     def test_glm_is_capped(self):
         assert db_mod.model_token_limits("system.ai.glm-5-2") == {
-            "context": 200_000,
-            "output": 25_000,
+            "context": 1_000_000,
+            "output": 65_536,
         }
 
     def test_glm_matches_any_version(self):
         assert db_mod.model_token_limits("system.ai.glm-4-6-flash") == {
-            "context": 200_000,
-            "output": 25_000,
+            "context": 1_000_000,
+            "output": 65_536,
         }
 
     def test_uncapped_model_returns_none(self):
@@ -277,6 +277,37 @@ class TestModelTokenLimits:
         # A bare `llama` key would pin Maverick's 1M context on the 128k Llama 3
         # endpoints.
         assert db_mod.model_token_limits("system.ai.meta-llama-3-3-70b-instruct") is None
+
+    def test_kimi_k3_gets_the_million_token_window(self):
+        # kimi-k3 specifically is 1M context (verified against safetyculture-safetyculture-production
+        # by SafetyCulture/experimental#478, 2026-08-11), distinct from the general "kimi" family
+        # (K2.7 Code, Inkling), which stays at the conservative 128k default.
+        assert db_mod.model_token_limits("databricks-kimi-k3") == {
+            "context": 1_000_000,
+            "output": 65_536,
+        }
+
+    def test_kimi_k2_7_code_keeps_the_family_default(self):
+        assert db_mod.model_token_limits("databricks-kimi-k2-7-code") == {
+            "context": 128_000,
+            "output": 65_536,
+        }
+
+    def test_glm_output_cap_matches_the_live_workspace_measurement(self):
+        # Corrected from PR#420's 25_000/200_000 (measured against a different Databricks
+        # workspace) to the value independently confirmed twice against our own workspace
+        # (SafetyCulture/experimental#474, 2026-08-05: "I confirmed the output cap exactly by
+        # tripping the gateway's rejection").
+        assert db_mod.model_token_limits("databricks-glm-5-2") == {
+            "context": 1_000_000,
+            "output": 65_536,
+        }
+
+    def test_longest_family_key_wins_regardless_of_dict_order(self):
+        # Guards the kimi vs kimi-k3 distinction: a naive first-match-in-iteration-order lookup
+        # would let the shorter "kimi" key mask "kimi-k3" depending on dict insertion order.
+        assert db_mod.model_token_limits("databricks-kimi-k3")["context"] == 1_000_000
+        assert db_mod.model_token_limits("databricks-kimi-k2-7-code")["context"] == 128_000
 
 
 class TestDiscoverModelServices:
