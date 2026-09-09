@@ -62,6 +62,14 @@ class _StubGateway(BaseHTTPRequestHandler):
 
 class TestMessagesEndpoint(unittest.TestCase):
     def setUp(self):
+        # DATABRICKS_BEARER is set directly below (not via monkeypatch, which
+        # only this test method has access to) — save/restore it ourselves,
+        # mirroring TestApplyPatEnvironment._isolated_bearer in
+        # test_databricks.py and TestConfigureSharedStateUsePat._isolated_bearer
+        # in test_cli.py, so it can't leak into later tests (e.g.
+        # TestGetDatabricksToken, which short-circuits on this env var).
+        self._original_databricks_bearer = os.environ.pop("DATABRICKS_BEARER", None)
+
         _StubGateway.response_body = {
             "id": "chatcmpl-1",
             "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
@@ -89,6 +97,10 @@ class TestMessagesEndpoint(unittest.TestCase):
         self.tokens.stop()
         self.gateway.shutdown()
         self.gateway.server_close()
+        if self._original_databricks_bearer is None:
+            os.environ.pop("DATABRICKS_BEARER", None)
+        else:
+            os.environ["DATABRICKS_BEARER"] = self._original_databricks_bearer
 
     def _post(self, path: str, payload: dict) -> tuple[int, dict]:
         request = urllib.request.Request(
