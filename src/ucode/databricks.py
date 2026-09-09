@@ -1626,6 +1626,26 @@ def model_token_limits(model_id: str) -> dict[str, int] | None:
     return None
 
 
+# Models with native image input on the mlflow chat-completions route. Everything
+# else gets images stripped to a text placeholder rather than sent and wasted or
+# rejected. Extend this if another model gains vision (SafetyCulture/experimental#478).
+VISION_FAMILIES: tuple[str, ...] = ("kimi-k3",)
+
+
+def supports_vision(model_id: str) -> bool:
+    return any(family in model_id for family in VISION_FAMILIES)
+
+
+def newest(models: list[str], family: str) -> str | None:
+    """Pick the highest-versioned model in `family` from a discovered model list.
+
+    Ids embed their version in the name (`glm-5-2`, `kimi-k3`), so a reverse
+    lexicographic sort is enough to prefer the newest — same approach as
+    SafetyCulture/experimental#474's `dbxclaude.databricks.newest`."""
+    matches = sorted((m for m in models if family in m), reverse=True)
+    return matches[0] if matches else None
+
+
 def _model_service_id(service: dict) -> str | None:
     """Extract the `system.ai.<model-name>` id from one model-service entry.
 

@@ -310,6 +310,24 @@ class TestModelTokenLimits:
         assert db_mod.model_token_limits("databricks-kimi-k2-7-code")["context"] == 128_000
 
 
+class TestNewest:
+    def test_picks_the_highest_versioned_model_in_a_family(self):
+        models = ["databricks-glm-4-6", "databricks-glm-5-2", "databricks-kimi-k2-7-code"]
+        assert db_mod.newest(models, "glm") == "databricks-glm-5-2"
+
+    def test_returns_none_when_the_family_has_no_match(self):
+        assert db_mod.newest(["databricks-glm-5-2"], "qwen") is None
+
+
+class TestSupportsVision:
+    def test_kimi_k3_supports_vision(self):
+        assert db_mod.supports_vision("databricks-kimi-k3") is True
+
+    def test_other_oss_models_do_not(self):
+        assert db_mod.supports_vision("databricks-kimi-k2-7-code") is False
+        assert db_mod.supports_vision("databricks-glm-5-2") is False
+
+
 class TestDiscoverModelServices:
     def test_buckets_families_by_name(self, monkeypatch):
         payload = {
