@@ -1540,6 +1540,18 @@ _MODEL_TOKEN_LIMITS: dict[str, dict[str, int]] = {
     # Every `output` here is the gateway's cap, which sits below the model's
     # native output length. Neither the model-services listing nor the
     # serving-endpoints API reports the cap, so it cannot be discovered.
+    #
+    # "kimi" carried over from a 2026-07-16 probe (github.com/lukecameron/ucode,
+    # commit c4df5b1) rather than the 2026-08-31 probe the rest of this table
+    # comes from (PR databricks/unity-gateway#420). Treat it as unverified: the
+    # two probes disagree on overlapping families (e.g. glm output was measured
+    # at 65_536 in the July probe vs 25_000 here), so the gateway's caps have
+    # moved at least once. Re-probe kimi against the live gateway before
+    # trusting this number; drop the entry if `output` turns out to be wrong in
+    # the direction that undercounts (a too-high cap here means a request that
+    # should have been rejected client-side 400s at the gateway instead — the
+    # same failure mode this table exists to prevent).
+    "kimi": {"context": 128_000, "output": 65_536},
     "glm": {"context": 200_000, "output": 25_000},
     "qwen": {"context": 262_144, "output": 25_000},
     "gpt-oss": {"context": 131_072, "output": 25_000},
