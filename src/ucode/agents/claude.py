@@ -319,6 +319,7 @@ def render_overlay(
     relayed_base_url: str | None = None,
     route_root_model: str | None = None,
     custom_model: str | None = None,
+    oss_shim_base_url: str | None = None,
 ) -> tuple[dict, list[list[str]]]:
     """Return (overlay, managed_key_paths) for Claude settings.json.
 
@@ -339,11 +340,22 @@ def render_overlay(
     `Authorization` credential, so no `apiKeyHelper` is written (it would outrank
     the subscription OAuth). The Databricks credential rides in the
     `X-Databricks-AI-Gateway-Token` swap header, injected per request by a local
-    refresh proxy at `relayed_base_url` — not written here."""
+    refresh proxy at `relayed_base_url` — not written here.
+
+    When `oss_shim_base_url` is set, the workspace has no Claude models but does
+    have OSS chat models (GLM, Kimi, ...) — `ucode.agents.claude_oss` is running
+    a local Anthropic<->OpenAI translation shim there (see `_launch_oss_shim`).
+    Like `relayed`, no `apiKeyHelper` is written: the shim authenticates to
+    Databricks with its own token and discards whatever Claude Code sends, so a
+    gateway apiKeyHelper here would be pointed at nothing. `provider_models`
+    carries the OSS ids to pin per Claude Code tier, same mechanism a
+    Bedrock-backed Model Provider Service already uses."""
     if relayed:
         if not relayed_base_url:
             raise RuntimeError("Relayed launch requires a proxy base URL.")
         base_url = relayed_base_url
+    elif oss_shim_base_url:
+        base_url = oss_shim_base_url
     else:
         base_url = build_tool_base_url("claude", workspace)
     # ANTHROPIC_CUSTOM_HEADERS is parsed as `key: value` pairs separated by
@@ -387,7 +399,7 @@ def render_overlay(
     # A Bedrock-backed provider needs its provider-side ids pinned verbatim
     # (Claude Code's canonical names aren't routable there). These come from the
     # service's targets, already de-duped to one id per family upstream.
-    elif provider and provider_models:
+    elif provider_models and (provider or oss_shim_base_url):
         if provider_models.get("opus"):
             env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = provider_models["opus"]
         if provider_models.get("sonnet"):
@@ -420,7 +432,7 @@ def render_overlay(
     # Relayed omits apiKeyHelper so Claude Code's subscription OAuth stays the
     # Authorization credential; every other path uses it as the gateway auth.
     overlay: dict = {"env": env}
-    if relayed:
+    if relayed or oss_shim_base_url:
         keys = [["env", k] for k in env]
     else:
         overlay["apiKeyHelper"] = build_auth_shell_command(workspace, profile, use_pat=use_pat)
@@ -567,6 +579,7 @@ def write_tool_config(
     route_root_model: str | None = None,
     custom_model: str | None = None,
     coding_agent_config_defaults: dict[str, str] | None = None,
+    oss_shim_base_url: str | None = None,
 ) -> dict:
     backup_existing_file(CLAUDE_SETTINGS_PATH, CLAUDE_BACKUP_PATH)
     web_search_model = _resolve_web_search_model(state)
@@ -587,6 +600,7 @@ def write_tool_config(
         relayed_base_url=relayed_base_url,
         route_root_model=route_root_model,
         custom_model=custom_model,
+        oss_shim_base_url=oss_shim_base_url,
     )
     tracing_env_vars = tracing_env(state, "claude")
     stop_hook_command = claude_tracing_stop_hook_command() if tracing_env_vars else None

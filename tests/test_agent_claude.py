@@ -412,6 +412,22 @@ class TestRenderOverlay:
         env_keys = [k for k in keys if len(k) == 2 and k[0] == "env"]
         assert len(env_keys) > 0
 
+    def test_render_overlay_points_at_the_oss_shim_when_given_a_base_url(self):
+        overlay, keys = claude.render_overlay(
+            "https://safetyculture-safetyculture-production.cloud.databricks.com",
+            None,
+            {},
+            provider_models={"opus": "databricks-glm-5-2[1m]", "sonnet": "databricks-kimi-k3[1m]"},
+            oss_shim_base_url="http://127.0.0.1:54321",
+        )
+        assert overlay["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:54321"
+        assert overlay["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "databricks-glm-5-2[1m]"
+        assert overlay["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-kimi-k3[1m]"
+        # The shim authenticates to Databricks itself; Claude Code must not be
+        # told to run a gateway apiKeyHelper that would try to reach it directly.
+        assert "apiKeyHelper" not in overlay
+        assert ["apiKeyHelper"] not in keys
+
 
 class TestRenderOverlayUserAgent:
     def _ua(self, monkeypatch) -> str:
