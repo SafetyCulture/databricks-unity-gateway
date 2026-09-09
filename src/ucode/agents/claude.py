@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import cast
 
 from ucode import gateway_proxy
+from ucode.agents.claude_oss.server import ModelRouter, make_server
 from ucode.config_io import (
     APP_DIR,
     ToolSpec,
@@ -29,6 +30,7 @@ from ucode.databricks import (
     build_auth_shell_command,
     build_tool_base_url,
     get_databricks_token,
+    newest,
 )
 from ucode.launcher import exec_or_spawn
 from ucode.managed_files import (
@@ -1305,6 +1307,74 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     raise SystemExit(returncode)
 
 
+def _launch_oss_shim(state: dict, binary: str, tool_args: list[str]) -> None:
+    """OSS-model launch: the workspace has no Claude models but does have OSS
+    chat models (GLM, Kimi, ...) on the mlflow gateway route. Start the local
+    Anthropic<->OpenAI translation shim (`ucode.agents.claude_oss`), then run
+    Claude Code alongside it — the shim must outlive the exec, so we
+    spawn-and-wait rather than replacing the process, same as `_launch_relayed`.
+    """
+    workspace = state["workspace"]
+    profile = state.get("profile")
+    oss_models: list[str] = state.get("oss_models") or []
+
+    glm = newest(oss_models, "glm") or oss_models[0]
+    kimi = newest(oss_models, "kimi") or glm
+    default = glm
+
+    tokens = gateway_proxy.TokenCache(workspace, profile)
+    router = ModelRouter(oss_models, default)
+    server = make_server(workspace, tokens, router)
+    bound_port = server.server_address[1]
+
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    refresher = threading.Thread(target=tokens.run_refresher, daemon=True)
+    refresher.start()
+
+    base_url = f"http://127.0.0.1:{bound_port}"
+    opus_model = _maybe_add_1m_suffix(glm)
+    sonnet_model = _maybe_add_1m_suffix(kimi)
+    haiku_model = _maybe_add_1m_suffix(glm)
+
+    write_tool_config(
+        state,
+        None,
+        provider_models={
+            "opus": opus_model,
+            "sonnet": sonnet_model,
+            "haiku": haiku_model,
+        },
+        oss_shim_base_url=base_url,
+    )
+
+    # write_tool_config's settings.json is what Claude Code reads for these
+    # values in the common case, but here we also pass them directly as
+    # process env: the child must never fall back to talking to the real
+    # Anthropic API, so ANTHROPIC_BASE_URL (and the model pins that make
+    # in-session /model switching resolve to real Databricks ids) are
+    # guaranteed present on the subprocess regardless of settings-file state.
+    env = {
+        **os.environ,
+        "ANTHROPIC_BASE_URL": base_url,
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": opus_model,
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": sonnet_model,
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": haiku_model,
+    }
+
+    proc = subprocess.Popen(_build_claude_argv(binary, tool_args), env=env)
+    try:
+        returncode = proc.wait()
+    except KeyboardInterrupt:
+        proc.send_signal(signal.SIGINT)
+        returncode = proc.wait()
+    finally:
+        tokens.stop()
+        server.shutdown()
+        server.server_close()
+    raise SystemExit(returncode)
+
+
 def launch(
     state: dict,
     tool_args: list[str],
@@ -1315,6 +1385,9 @@ def launch(
     workspace = state.get("workspace")
     if state.get("claude_relayed"):
         _launch_relayed(state, binary, tool_args)
+        return
+    if state.get("claude_oss_fallback"):
+        _launch_oss_shim(state, binary, tool_args)
         return
     # Smart routing v2 needs Unix PTY support, which Windows does not provide.
     if options.launch_smart_routing and os.name == "nt":

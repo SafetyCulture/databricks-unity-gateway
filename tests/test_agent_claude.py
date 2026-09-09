@@ -1094,6 +1094,44 @@ class TestClaudeLaunch:
         )
         assert calls[-3:] == [("stop",), ("shutdown",), ("close",)]
 
+    def test_launch_oss_shim_starts_the_server_and_runs_claude_against_it(
+        self, monkeypatch, tmp_path
+    ):
+        state = {
+            "workspace": "https://example.cloud.databricks.com",
+            "oss_models": ["databricks-glm-5-2", "databricks-kimi-k3"],
+        }
+        started = {}
+
+        class FakeProc:
+            returncode = 0
+
+            def wait(self):
+                return 0
+
+        def fake_popen(argv, **kwargs):
+            started["argv"] = argv
+            started["env"] = kwargs.get("env")
+            return FakeProc()
+
+        monkeypatch.setattr(claude.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *a, **k: "fake-token")
+        # TokenCache._refresh calls gateway_proxy's own bound import of
+        # get_databricks_token, not claude's — patch it there too so
+        # constructing the shim's TokenCache doesn't shell out for real.
+        monkeypatch.setattr(
+            claude.gateway_proxy, "get_databricks_token", lambda *a, **k: "fake-token"
+        )
+        monkeypatch.setattr(claude, "write_tool_config", lambda *a, **k: {})
+
+        with pytest.raises(SystemExit) as exc:
+            claude._launch_oss_shim(state, "claude", [])
+
+        assert exc.value.code == 0
+        assert started["env"]["ANTHROPIC_BASE_URL"].startswith("http://127.0.0.1:")
+        assert started["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"].startswith("databricks-glm-5-2")
+        assert started["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"].startswith("databricks-kimi-k3")
+
     def test_smart_routing_on_windows_is_not_supported(self, monkeypatch):
         monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.setattr(claude.os, "name", "nt")
