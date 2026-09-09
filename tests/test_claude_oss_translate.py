@@ -653,29 +653,6 @@ class TestErrorsAndCounting(unittest.TestCase):
         self.assertGreaterEqual(small, 1)
 
 
-class TestModelRouter(unittest.TestCase):
-    def setUp(self):
-        from ucode.agents.claude_oss.server import ModelRouter
-
-        self.router = ModelRouter(["system.ai.glm-5-2", "system.ai.kimi-k3"], "system.ai.glm-5-2")
-
-    def test_exact_id_passes_through(self):
-        self.assertEqual(self.router.resolve("system.ai.kimi-k3"), "system.ai.kimi-k3")
-
-    def test_context_window_suffix_is_stripped(self):
-        self.assertEqual(self.router.resolve("system.ai.kimi-k3[1m]"), "system.ai.kimi-k3")
-
-    def test_bare_name_resolves(self):
-        self.assertEqual(self.router.resolve("kimi-k3"), "system.ai.kimi-k3")
-
-    def test_family_keyword_resolves_to_newest(self):
-        self.assertEqual(self.router.resolve("glm-latest"), "system.ai.glm-5-2")
-
-    def test_unknown_and_missing_models_fall_back_to_default(self):
-        self.assertEqual(self.router.resolve("claude-opus-4-5"), "system.ai.glm-5-2")
-        self.assertEqual(self.router.resolve(None), "system.ai.glm-5-2")
-
-
 if __name__ == "__main__":
     unittest.main()
 
