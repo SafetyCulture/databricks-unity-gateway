@@ -1502,6 +1502,16 @@ _MODEL_SERVICE_PARENT_SCHEMA = "schemas/system.ai"
 # support a new family.
 _OSS_MODEL_FAMILIES = ("kimi-", "glm-", "deepseek-")
 
+
+def _is_oss_chat_model(model_id: str) -> bool:
+    """True if `model_id` matches a supported OSS chat family.
+
+    Shares `_OSS_MODEL_FAMILIES` with `classify_model_family` and
+    `discover_model_services` below, so `discover_oss_models`'s AI-Gateway
+    fallback buckets a model the same way the UC model-services path does.
+    """
+    return any(family in model_id for family in _OSS_MODEL_FAMILIES)
+
 # Claude model families ucode buckets, newest tier first. Each maps to a
 # Claude Code family alias (ANTHROPIC_DEFAULT_<FAMILY>_MODEL). Add an entry to
 # support a new family in both discovery paths (`claude-<family>-*` via the
