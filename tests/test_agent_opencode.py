@@ -181,13 +181,16 @@ class TestRenderOverlay:
         # OpenCode's schema requires both context and output on `limit`.
         assert glm["limit"] == {"context": 200000, "output": 25000}
 
-    def test_non_glm_oss_model_has_no_output_cap(self):
-        models = {"oss": ["system.ai.kimi-k2-7-code"]}
+    def test_unknown_oss_family_has_no_output_cap(self):
+        # kimi-k2-7-code now has a known limit (see docs/superpowers/plans/
+        # 2026-09-09-claude-oss-shim.md Task 0) — use a family this table
+        # genuinely has no entry for to test "no known limit".
+        models = {"oss": ["system.ai.made-up-model-xyz"]}
         overlay, _ = opencode.render_overlay(
-            "system.ai.kimi-k2-7-code", "tok", _base_urls(), models
+            "system.ai.made-up-model-xyz", "tok", _base_urls(), models
         )
-        kimi = overlay["provider"]["databricks-oss"]["models"]["system.ai.kimi-k2-7-code"]
-        assert "limit" not in kimi
+        unknown = overlay["provider"]["databricks-oss"]["models"]["system.ai.made-up-model-xyz"]
+        assert "limit" not in unknown
 
     def test_qwen_gets_token_limits(self):
         model = "system.ai.qwen35-122b-a10b"

@@ -259,7 +259,10 @@ class TestModelTokenLimits:
         }
 
     def test_uncapped_model_returns_none(self):
-        assert db_mod.model_token_limits("system.ai.kimi-k2-7-code") is None
+        # kimi-k2-7-code now has a known limit (see TestModelTokenLimits below /
+        # docs/superpowers/plans/2026-09-09-claude-oss-shim.md Task 0) — use a
+        # family this table genuinely has no entry for for "no known limit".
+        assert db_mod.model_token_limits("system.ai.made-up-model-xyz") is None
 
     def test_gateway_caps_measured_against_the_workspace(self):
         # Each `output` is the cap the gateway enforces; a request above it fails

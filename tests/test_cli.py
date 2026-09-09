@@ -2685,6 +2685,12 @@ class TestConfigureSharedStateUsePat:
         monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: ({}, None))
         monkeypatch.setattr(cli_mod, "discover_gemini_models", lambda w, t: ([], None))
         monkeypatch.setattr(cli_mod, "discover_codex_models", lambda w, t: ([], None))
+        # discover_oss_models falls back to its own _http_get_json calls when
+        # discover_model_services returns no oss models (see discover_oss_models
+        # in databricks.py) — stub it directly so it doesn't compete with this
+        # class's own _http_get_json monkeypatch, which several tests below feed
+        # a response iterator sized for probe_unity_gateway_capabilities alone.
+        monkeypatch.setattr(cli_mod, "discover_oss_models", lambda w, t: ([], None))
         monkeypatch.setattr(cli_mod, "build_shared_base_urls", lambda w: {})
         return cli_mod, logins, ensures, saved
 

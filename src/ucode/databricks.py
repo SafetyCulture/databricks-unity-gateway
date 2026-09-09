@@ -1498,19 +1498,53 @@ _MODEL_SERVICE_REQUIRED_PREFIX = "system.ai."
 # is the only server-side narrowing that works.
 _MODEL_SERVICE_PARENT_SCHEMA = "schemas/system.ai"
 
-# Supported OSS chat families, matched by name substring. Add an entry to
-# support a new family.
+# Supported OSS chat families for discover_model_services / classify_model_family
+# (the Unity Catalog system.ai.* model-services listing), matched by name
+# substring. Add an entry to support a new family on that path specifically —
+# see _AI_GATEWAY_OSS_FAMILIES below for the separate, broader cohort the
+# AI-Gateway foundation-model serving-endpoints fallback recognizes.
 _OSS_MODEL_FAMILIES = ("kimi-", "glm-", "deepseek-")
+
+# Supported OSS chat families for discover_oss_models's AI-Gateway fallback
+# (serving endpoints on the mlflow/v1/chat/completions route), matched by name
+# substring. Deliberately NOT shared with _OSS_MODEL_FAMILIES above:
+# discover_model_services's own tests (test_oss_allowlist_drops_unsupported_families,
+# test_no_matching_families_reports_sample) assert llama/qwen are NOT
+# recognized on the model-services path, while lukecameron/ucode's
+# fix/oss-serving-endpoints-fallback branch, databricks/unity-gateway#420, and
+# SafetyCulture/experimental#474 all independently confirm this broader cohort
+# is real and reachable on the AI-Gateway route specifically. The two listings
+# expose different things under different ids (see discover_oss_models's
+# docstring), so their supported-family scopes are allowed to differ too.
+_AI_GATEWAY_OSS_FAMILIES = (
+    "kimi-",
+    "glm-",
+    "deepseek-",
+    "inkling",
+    "llama-",
+    "qwen",
+    "gpt-oss-",
+    "gemma-",
+)
+
+# Services that share a family substring with a chat model but cannot back a
+# chat agent (`qwen3-embedding-*` matches the bare "qwen" family). The
+# foundation-models listing doesn't expose api_types, so these have to be
+# excluded by name instead.
+_OSS_NON_CHAT_SUBSTRINGS = ("embedding", "embed", "rerank")
 
 
 def _is_oss_chat_model(model_id: str) -> bool:
-    """True if `model_id` matches a supported OSS chat family.
+    """True if `model_id` matches an AI-Gateway-fallback OSS chat family.
 
-    Shares `_OSS_MODEL_FAMILIES` with `classify_model_family` and
-    `discover_model_services` below, so `discover_oss_models`'s AI-Gateway
-    fallback buckets a model the same way the UC model-services path does.
+    Used only by discover_oss_models's serving-endpoints fallback — see
+    _AI_GATEWAY_OSS_FAMILIES for why this is a different, broader cohort than
+    discover_model_services'/classify_model_family's _OSS_MODEL_FAMILIES.
     """
-    return any(family in model_id for family in _OSS_MODEL_FAMILIES)
+    if any(bad in model_id for bad in _OSS_NON_CHAT_SUBSTRINGS):
+        return False
+    return any(family in model_id for family in _AI_GATEWAY_OSS_FAMILIES)
+
 
 # Claude model families ucode buckets, newest tier first. Each maps to a
 # Claude Code family alias (ANTHROPIC_DEFAULT_<FAMILY>_MODEL). Add an entry to
