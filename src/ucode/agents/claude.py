@@ -1572,3 +1572,13 @@ def validate_cmd(binary: str) -> list[str]:
         "--max-turns",
         "1",
     ]
+
+
+def skip_validation(state: dict) -> bool:
+    """Relayed configs can't be probed with a live message: the loopback proxy
+    and subscription login are only established at launch, so a validation-time
+    request has nothing listening and would hang (and burn subscription quota).
+    The OSS shim has the same property — its loopback server is only started
+    inside `_launch_oss_shim`, at launch time — so claude_oss_fallback skips
+    validation too."""
+    return bool(state.get("claude_relayed")) or bool(state.get("claude_oss_fallback"))
