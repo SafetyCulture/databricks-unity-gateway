@@ -175,6 +175,57 @@ class TestMessagesEndpoint(_ShimServerCase):
         self.assertEqual(ctx.exception.code, 404)
 
 
+class TestMalformedRequestBodies(_ShimServerCase):
+    """`translate._convert_messages` iterates `request["messages"]` and calls
+    `.get` on each element, so a bare string is walked character by character and
+    raises AttributeError. Nothing in BaseHTTPRequestHandler turns that into a
+    response — the connection just drops mid-turn. Malformed input has to come
+    back as a clean 400."""
+
+    def _expect_400(self, path: str, payload) -> dict:
+        request = urllib.request.Request(
+            f"{self.base_url}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(request)
+        self.assertEqual(ctx.exception.code, 400)
+        return json.loads(ctx.exception.read().decode("utf-8"))
+
+    def test_messages_as_a_string_is_a_400(self):
+        body = self._expect_400("/v1/messages", {"model": "databricks-glm-5-2", "messages": "hi"})
+        self.assertEqual(body["type"], "error")
+        self.assertEqual(body["error"]["type"], "invalid_request_error")
+
+    def test_a_message_that_is_not_an_object_is_a_400(self):
+        self._expect_400("/v1/messages", {"messages": ["just a string"]})
+
+    def test_a_non_object_top_level_body_is_a_400(self):
+        # `body.get("model")` would raise on a list before translation is reached.
+        self._expect_400("/v1/messages", ["not", "an", "object"])
+
+    def test_count_tokens_has_the_same_guard(self):
+        # count_tokens walks `messages` the same way _convert_messages does.
+        self._expect_400("/v1/messages/count_tokens", {"messages": "hi"})
+
+    def test_count_tokens_rejects_a_non_object_top_level_body(self):
+        self._expect_400("/v1/messages/count_tokens", "hello")
+
+    def test_a_valid_request_still_succeeds_after_a_malformed_one(self):
+        self._expect_400("/v1/messages", {"messages": "hi"})
+        status, body = self._post(
+            "/v1/messages",
+            {
+                "model": "databricks-glm-5-2",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["content"][0]["text"], "hi")
+
+
 class TestErrorResponseFraming(_ShimServerCase):
     """`protocol_version = "HTTP/1.1"` means keep-alive by default, but two error
     paths answer without having consumed the request body: the unknown-path 404
