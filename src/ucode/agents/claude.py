@@ -1478,13 +1478,37 @@ def _launch_oss_shim(state: dict, binary: str, tool_args: list[str]) -> None:
     # Anthropic API, so ANTHROPIC_BASE_URL (and the model pins that make
     # in-session /model switching resolve to real Databricks ids) are
     # guaranteed present on the subprocess regardless of settings-file state.
+    #
+    # ANTHROPIC_BASE_URL redirection is the ONLY thing this launch mode relies on
+    # to guarantee every request goes through the shim, so anything inherited
+    # from the parent environment that could make Claude Code route around it —
+    # a real Anthropic credential, or a native Bedrock/Vertex routing flag — is
+    # filtered out while building `env`, rather than popped afterward (the
+    # latter reads the same but confuses ty's overload resolution on the
+    # subprocess.Popen call below). The session would otherwise still show the
+    # OSS model id as "selected" while actually talking to real
+    # Anthropic/Bedrock/Vertex. Mirrors the equivalent strip in the source this
+    # launch mode was ported from (SafetyCulture/experimental#474).
     env = {
-        **os.environ,
-        "ANTHROPIC_BASE_URL": base_url,
-        "ANTHROPIC_DEFAULT_OPUS_MODEL": opus_model,
-        "ANTHROPIC_DEFAULT_SONNET_MODEL": sonnet_model,
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL": haiku_model,
+        key: value
+        for key, value in os.environ.items()
+        if key
+        not in (
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_ENTRYPOINT",
+        )
     }
+    env.update(
+        {
+            "ANTHROPIC_BASE_URL": base_url,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": opus_model,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": sonnet_model,
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": haiku_model,
+        }
+    )
 
     proc = subprocess.Popen(_build_claude_argv(binary, tool_args), env=env)
     try:

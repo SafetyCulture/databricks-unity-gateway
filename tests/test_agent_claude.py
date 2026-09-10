@@ -1360,6 +1360,59 @@ class TestClaudeLaunch:
             "haiku": "databricks-glm-5-2[1m]",
         }
 
+    def test_launch_oss_shim_strips_env_that_would_bypass_it(self, monkeypatch, tmp_path):
+        """A real Anthropic credential or a native Bedrock/Vertex routing flag
+        anywhere in the parent shell environment must not survive into the child:
+        either would give Claude Code a way to reach a real Claude model directly,
+        ignoring ANTHROPIC_BASE_URL entirely. ANTHROPIC_BASE_URL redirection is the
+        ONLY mechanism this whole launch mode relies on to guarantee traffic goes
+        through the shim, so anything that can make Claude Code route around it
+        defeats the entire point silently - the session would still show
+        "databricks-kimi-k3[1m]" as the selected model while actually talking to
+        real Anthropic/Bedrock/Vertex."""
+        state = {
+            "workspace": "https://example.cloud.databricks.com",
+            "oss_models": ["databricks-glm-5-2", "databricks-kimi-k3"],
+        }
+        started = {}
+
+        class FakeProc:
+            returncode = 0
+
+            def wait(self):
+                return 0
+
+        def fake_popen(argv, **kwargs):
+            started["env"] = kwargs.get("env")
+            return FakeProc()
+
+        monkeypatch.setattr(claude.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *a, **k: "fake-token")
+        monkeypatch.setattr(
+            claude.gateway_proxy, "get_databricks_token", lambda *a, **k: "fake-token"
+        )
+        monkeypatch.setattr(claude, "write_tool_config", lambda *a, **k: {})
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-a-real-looking-key")
+        monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+        monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "1")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "some-other-session")
+        monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "some-other-entrypoint")
+        # A harmless, unrelated var must NOT be swept up by whatever strips these.
+        monkeypatch.setenv("SOME_UNRELATED_VAR", "keep-me")
+
+        with pytest.raises(SystemExit):
+            claude._launch_oss_shim(state, "claude", [])
+
+        for key in (
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_ENTRYPOINT",
+        ):
+            assert key not in started["env"], f"{key} must not reach the Claude Code child"
+        assert started["env"]["SOME_UNRELATED_VAR"] == "keep-me"
+
     def test_launch_oss_shim_omits_the_1m_suffix_for_a_smaller_context_model(
         self, monkeypatch, tmp_path
     ):
