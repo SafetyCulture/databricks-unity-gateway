@@ -1397,6 +1397,21 @@ Any row that fails is a real bug in the port, not a spec problem — the exact s
 
 ---
 
+## Post-merge follow-up: native `/v1/models` discovery
+
+After the plan above shipped and was live-verified, a follow-up question came up: can Claude Code's native `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` (which calls `GET {ANTHROPIC_BASE_URL}/v1/models` to populate the full `/model` picker) be turned on for the OSS shim, so every GLM/Kimi variant shows up individually instead of just the 3 hardcoded Opus/Sonnet/Haiku tiers?
+
+Added a `GET /v1/models` route to `claude_oss/server.py` (Anthropic-shaped response, built from the router's own catalogue) and turned discovery on unconditionally in `_launch_oss_shim`'s child env. Two real bugs surfaced from live-testing against the actual `claude` binary (commit `621a9dd`), both fixed and verified:
+
+1. Claude Code refuses to call `/v1/models` at all without a credential (`ANTHROPIC_AUTH_TOKEN`/`apiKeyHelper`/API key) present, regardless of the discovery flag — fixed with a placeholder `ANTHROPIC_AUTH_TOKEN` (harmless: the shim never reads what Claude Code sends).
+2. Claude Code requests `/v1/models?limit=1000`, and the route match didn't strip the query string — fixed to match `do_POST`'s existing pattern.
+
+**Known limitation, not fixed:** even with both bugs fixed and the request returning 200, Claude Code's own client-side parser logged `[Bootstrap] Gateway /v1/models -> 0 custom options` for the real GLM/Kimi catalogue. Isolated with a controlled test (same test rig, same catalogue plus one added fake `databricks-claude-opus-9-9` entry): the fake claude-family-shaped id was picked up (`1 custom options`), the real GLM/Kimi ids were not. Claude Code's discovery parser appears to only recognize ids matching known Claude-family naming patterns and silently drops anything else — this is client-side filtering, not something fixable from the shim's response shape.
+
+A candidate alternate mechanism was spotted but not investigated: Claude Code's own "unrecognized_model" warning says to map a model "with `behavesAs` on a modelPicker row (or `modelOverrides`, if it is a provider id of a model this version knows)". `modelOverrides` already exists in this codebase (`smart_routing/v2.py`'s `_claude_model_overrides`) but only aliases short names onto recognized `claude-*` ids — not a fit for genuinely custom ids. `behavesAs`/`modelPicker` is undocumented territory (not in the schemastore schema, not in this codebase) that would need its own investigation.
+
+Decision: stop here. The 2 real fixes are kept (they're correct, live-verified, no regressions) and discovery stays on (harmless no-op for non-Claude ids, and free upside if a future Claude Code version recognizes more patterns or a `behavesAs` mechanism is added later). The 3-tier Opus/Sonnet/Haiku mapping from the original plan remains the actual ceiling for how many distinct GLM/Kimi rows appear in `/model` today.
+
 ## Self-Review Notes
 
 - **Spec coverage:** PR #474 (translate.py, server.py, databricks.py primitives, launch wiring, security posture) → Tasks 2-5. PR #475 (tool search default) → Task 6 Step 6 (already true, verified not re-implemented). PR #478 (per-model context windows, `[1m]` suffix, vision) → Task 0 (context table), Task 1 (`supports_vision`), Task 3 (`allow_images` wiring), Task 5 (`_maybe_add_1m_suffix` reuse). The `probe`/`models` CLI commands → Task 8. The standalone tool's own `TokenCache`/`discover_oss_models`/family tables are deliberately NOT ported — Task 3 explains why (this repo already has better versions of all three, and duplicating them is what caused the Task 0 bug).
