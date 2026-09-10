@@ -1431,6 +1431,39 @@ def _oss_model_name(model: str) -> str:
     return model
 
 
+def _assign_oss_model_tiers(oss_models: list[str]) -> tuple[str, str, str]:
+    """Pick which OSS model backs each of Claude Code's 3 picker tiers.
+
+    Claude Code's `/model` picker only ever shows 3 rows (Opus/Sonnet/Haiku) —
+    native gateway discovery (`claude_oss/server.py`'s `/v1/models` route)
+    cannot add more, because Claude Code's own discovery parser only
+    recognizes ids matching a known Claude-family pattern and silently drops
+    anything else (live-confirmed: a real GLM/Kimi catalogue reports "0 custom
+    options", a Claude-shaped id reports "1"). So with 3 rows and up to 6
+    models on a workspace like this one (glm-5-2, glm-5-3, glm-5-3-flash,
+    inkling, kimi-k2-7-code, kimi-k3), the assignment has to make a choice
+    rather than discover one:
+
+      Opus   = the newest Kimi (the flagship reasoning model)
+      Sonnet = the newest "quality" GLM (excludes any "flash" sibling)
+      Haiku  = the newest "flash" GLM (falls back to the quality GLM if the
+               workspace has no flash variant at all)
+
+    This uses all 3 tiers for 3 distinct models, unlike the previous scheme,
+    which pinned the same "newest GLM" to both Opus and Haiku and never
+    surfaced Kimi's flagship tier at all."""
+    glm_candidates = [m for m in oss_models if "glm" in m]
+    glm_flash = newest([m for m in glm_candidates if "flash" in m], "glm")
+    glm_quality = newest([m for m in glm_candidates if "flash" not in m], "glm")
+    kimi = newest(oss_models, "kimi")
+
+    fallback = glm_quality or glm_flash or kimi or oss_models[0]
+    opus = kimi or fallback
+    sonnet = glm_quality or glm_flash or fallback
+    haiku = glm_flash or glm_quality or fallback
+    return opus, sonnet, haiku
+
+
 def _launch_oss_shim(state: dict, binary: str, tool_args: list[str]) -> None:
     """OSS-model launch: the workspace has no Claude models but does have OSS
     chat models (GLM, Kimi, ...) on the mlflow gateway route. Start the local
@@ -1442,9 +1475,8 @@ def _launch_oss_shim(state: dict, binary: str, tool_args: list[str]) -> None:
     profile = state.get("profile")
     oss_models: list[str] = state.get("oss_models") or []
 
-    glm = newest(oss_models, "glm") or oss_models[0]
-    kimi = newest(oss_models, "kimi") or glm
-    default = glm
+    opus, sonnet, haiku = _assign_oss_model_tiers(oss_models)
+    default = opus
 
     tokens = gateway_proxy.TokenCache(workspace, profile)
     router = ModelRouter(oss_models, default)
@@ -1457,9 +1489,9 @@ def _launch_oss_shim(state: dict, binary: str, tool_args: list[str]) -> None:
     refresher.start()
 
     base_url = f"http://{LOOPBACK_HOST}:{bound_port}"
-    opus_model = _oss_model_name(glm)
-    sonnet_model = _oss_model_name(kimi)
-    haiku_model = _oss_model_name(glm)
+    opus_model = _oss_model_name(opus)
+    sonnet_model = _oss_model_name(sonnet)
+    haiku_model = _oss_model_name(haiku)
 
     write_tool_config(
         state,

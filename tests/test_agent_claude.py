@@ -117,6 +117,47 @@ class TestOssLongContextSuffix:
         assert claude._maybe_add_1m_suffix("databricks-glm-5-2") == "databricks-glm-5-2"
 
 
+class TestAssignOssModelTiers:
+    """Claude Code's /model picker only ever shows 3 rows, and native gateway
+    discovery cannot add more (see the plan doc's post-merge follow-up note -
+    Claude Code's own discovery parser silently drops non-Claude-family ids).
+    So with up to 6 OSS models on a real workspace, the 3 tiers have to make a
+    deliberate choice rather than discover one."""
+
+    def test_the_live_safetyculture_catalogue(self):
+        # The exact 6-model catalogue this workspace has today.
+        models = [
+            "databricks-glm-5-2",
+            "databricks-glm-5-3",
+            "databricks-glm-5-3-flash",
+            "databricks-inkling",
+            "databricks-kimi-k2-7-code",
+            "databricks-kimi-k3",
+        ]
+        opus, sonnet, haiku = claude._assign_oss_model_tiers(models)
+        assert opus == "databricks-kimi-k3"
+        assert sonnet == "databricks-glm-5-3"
+        assert haiku == "databricks-glm-5-3-flash"
+
+    def test_falls_back_to_the_quality_glm_when_there_is_no_flash_variant(self):
+        models = ["databricks-glm-5-2", "databricks-kimi-k3"]
+        opus, sonnet, haiku = claude._assign_oss_model_tiers(models)
+        assert opus == "databricks-kimi-k3"
+        assert sonnet == "databricks-glm-5-2"
+        assert haiku == "databricks-glm-5-2"
+
+    def test_falls_back_to_glm_when_there_is_no_kimi_at_all(self):
+        models = ["databricks-glm-5-3", "databricks-glm-5-3-flash"]
+        opus, sonnet, haiku = claude._assign_oss_model_tiers(models)
+        assert opus == "databricks-glm-5-3"
+        assert sonnet == "databricks-glm-5-3"
+        assert haiku == "databricks-glm-5-3-flash"
+
+    def test_a_single_model_backs_every_tier(self):
+        opus, sonnet, haiku = claude._assign_oss_model_tiers(["databricks-inkling"])
+        assert opus == sonnet == haiku == "databricks-inkling"
+
+
 class TestRenderOverlay:
     def test_long_context_suffix_supports_major_only_claude_versions(self):
         assert claude._maybe_add_1m_suffix("system.ai.claude-sonnet-5") == (
@@ -1349,14 +1390,16 @@ class TestClaudeLaunch:
         assert started["env"]["ANTHROPIC_BASE_URL"].startswith("http://127.0.0.1:")
         # Exact ids, suffix included: GLM and Kimi K3 are both 1M-context, and the
         # `[1m]` suffix is the only thing that tells Claude Code so (it assumes
-        # 200k otherwise and auto-compacts five times too early).
-        assert started["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "databricks-glm-5-2[1m]"
-        assert started["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-kimi-k3[1m]"
+        # 200k otherwise and auto-compacts five times too early). Opus = Kimi
+        # (flagship), Sonnet/Haiku fall back to the one available GLM since this
+        # workspace has no separate flash variant (see _assign_oss_model_tiers).
+        assert started["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "databricks-kimi-k3[1m]"
+        assert started["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-glm-5-2[1m]"
         assert started["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "databricks-glm-5-2[1m]"
         # The same ids reach the settings file Claude Code reads.
         assert written[0]["provider_models"] == {
-            "opus": "databricks-glm-5-2[1m]",
-            "sonnet": "databricks-kimi-k3[1m]",
+            "opus": "databricks-kimi-k3[1m]",
+            "sonnet": "databricks-glm-5-2[1m]",
             "haiku": "databricks-glm-5-2[1m]",
         }
 
@@ -1494,7 +1537,8 @@ class TestClaudeLaunch:
         self, monkeypatch, tmp_path
     ):
         """A workspace whose only Kimi is the 128k K2 must not be advertised as
-        1M — the suffix is a claim about the window, not decoration."""
+        1M — the suffix is a claim about the window, not decoration. Kimi backs
+        Opus (see _assign_oss_model_tiers), so it's Opus that must stay bare."""
         state = {
             "workspace": "https://example.cloud.databricks.com",
             "oss_models": ["databricks-glm-5-2", "databricks-kimi-k2-7-code"],
@@ -1521,8 +1565,8 @@ class TestClaudeLaunch:
         with pytest.raises(SystemExit):
             claude._launch_oss_shim(state, "claude", [])
 
-        assert started["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "databricks-glm-5-2[1m]"
-        assert started["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-kimi-k2-7-code"
+        assert started["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "databricks-kimi-k2-7-code"
+        assert started["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-glm-5-2[1m]"
 
     def test_smart_routing_on_windows_is_not_supported(self, monkeypatch):
         monkeypatch.setenv(v2.ENV_VAR, "1")
