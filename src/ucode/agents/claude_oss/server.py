@@ -27,7 +27,9 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from ucode.constants import LOOPBACK_HOST
 from ucode.databricks import model_token_limits, newest, supports_vision
+from ucode.gateway_proxy import log_token_refresh_failure
 
 from . import translate
 
@@ -144,7 +146,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error(400, "Request body was not valid JSON.")
             return None
 
-    def _upstream(self, payload: dict, *, stream: bool):
+    def _open_upstream(self, payload: dict, *, stream: bool):
         url = f"{self.host.rstrip('/')}{OSS_ROUTE}"
         request = urllib.request.Request(
             url,
@@ -159,6 +161,45 @@ class Handler(BaseHTTPRequestHandler):
             },
         )
         return urllib.request.urlopen(request, timeout=900)
+
+    def _upstream(self, payload: dict, *, stream: bool):
+        """POST to the gateway route, retrying once with a force-refreshed token
+        if the first attempt is rejected as unauthenticated.
+
+        `TokenCache._ensure_fresh` deliberately keeps serving a possibly-stale
+        token when a background refresh fails, on the stated understanding that
+        "a request that then 401s triggers a forced refresh + retry" — which
+        `gateway_proxy._ProxyHandler._handle` implements for the relayed proxy.
+        Without the same retry here, a token that lapsed across a laptop sleep
+        (the monotonic clock the refresher polls on stops advancing) reaches
+        Claude Code as an `authentication_error` in the middle of a session, and
+        the only recovery is restarting it.
+
+        One retry, not a loop, matching `_handle`: if the second attempt is still
+        rejected the credential really is bad, and the gateway's own message
+        should reach the caller rather than being retried behind their back.
+        """
+        try:
+            return self._open_upstream(payload, stream=stream)
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (401, 403):
+                raise
+            # Drain the small error body so the connection can be released.
+            try:
+                exc.read()
+                exc.close()
+            except OSError:
+                pass
+        self.trace("token_refresh", {"reason": "upstream rejected the token"})
+        try:
+            self.tokens.refresh()
+        except RuntimeError as exc:
+            # The Databricks OAuth session is dead, not just the access token, and
+            # cannot be re-minted non-interactively. Surface the `databricks auth
+            # login` hint, then still retry so the gateway's own status and message
+            # are what the caller sees.
+            log_token_refresh_failure(exc)
+        return self._open_upstream(payload, stream=stream)
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path.rstrip("/") in ("/health", ""):
@@ -307,8 +348,8 @@ def make_server(
         },
     )
     try:
-        return ThreadingHTTPServer(("127.0.0.1", port), handler)
+        return ThreadingHTTPServer((LOOPBACK_HOST, port), handler)
     except OSError:
         # Requested port is taken (a stale shim from a killed session still
         # holding the socket) — let the OS pick one; the caller reads it back.
-        return ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        return ThreadingHTTPServer((LOOPBACK_HOST, 0), handler)

@@ -44,13 +44,23 @@ class _StubGateway(BaseHTTPRequestHandler):
 
     response_body: dict = {}
     last_headers: dict[str, str] = {}
+    # Statuses to return for the next N calls, consumed in order; anything past
+    # the end of the list is a 200. Lets a test script an auth rejection followed
+    # by a success without a second stub class.
+    statuses: list[int] = []
+    seen_authorizations: list[str] = []
 
     def do_POST(self):  # noqa: N802
         type(self).last_headers = dict(self.headers)
+        type(self).seen_authorizations.append(self.headers.get("Authorization", ""))
         length = int(self.headers.get("Content-Length") or 0)
         self.request_body = json.loads(self.rfile.read(length).decode("utf-8"))
-        body = json.dumps(type(self).response_body).encode("utf-8")
-        self.send_response(200)
+        status = type(self).statuses.pop(0) if type(self).statuses else 200
+        payload = (
+            type(self).response_body if status == 200 else {"message": "token expired or invalid"}
+        )
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -60,7 +70,10 @@ class _StubGateway(BaseHTTPRequestHandler):
         return
 
 
-class TestMessagesEndpoint(unittest.TestCase):
+class _ShimServerCase(unittest.TestCase):
+    """Stands a shim server up in front of `_StubGateway`. Underscore-prefixed so
+    pytest collects only the concrete cases below, not this one twice."""
+
     def setUp(self):
         # DATABRICKS_BEARER is set directly below (not via monkeypatch, which
         # only this test method has access to) — save/restore it ourselves,
@@ -76,6 +89,8 @@ class TestMessagesEndpoint(unittest.TestCase):
             "usage": {"prompt_tokens": 10, "completion_tokens": 2},
         }
         _StubGateway.last_headers = {}
+        _StubGateway.statuses = []
+        _StubGateway.seen_authorizations = []
         self.gateway = HTTPServer(("127.0.0.1", 0), _StubGateway)
         threading.Thread(target=self.gateway.serve_forever, daemon=True).start()
         gateway_host = f"http://127.0.0.1:{self.gateway.server_address[1]}"
@@ -112,6 +127,8 @@ class TestMessagesEndpoint(unittest.TestCase):
         with urllib.request.urlopen(request) as response:
             return response.status, json.loads(response.read().decode("utf-8"))
 
+
+class TestMessagesEndpoint(_ShimServerCase):
     def test_non_streaming_message_translates_both_ways(self):
         status, body = self._post(
             "/v1/messages",
@@ -155,3 +172,100 @@ class TestMessagesEndpoint(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             self._post("/not-a-real-path", {})
         self.assertEqual(ctx.exception.code, 404)
+
+
+class TestUpstreamAuthRetry(_ShimServerCase):
+    """`TokenCache._ensure_fresh` keeps serving a possibly-stale token when a
+    background refresh fails, on the documented understanding that "a request
+    that then 401s triggers a forced refresh + retry" — which
+    `gateway_proxy._ProxyHandler._handle` implements. The shim must do the same,
+    or a token that lapsed across a laptop sleep surfaces to Claude Code as an
+    authentication_error mid-session with no recovery short of a restart."""
+
+    def _track_refresh(self, new_token: str = "refreshed-token") -> list[str]:
+        """Record each `tokens.refresh()` and make it mint a distinguishable
+        token, so the retry can be shown to carry the NEW credential."""
+        refreshes: list[str] = []
+        original = self.tokens.refresh
+
+        def tracked() -> None:
+            os.environ["DATABRICKS_BEARER"] = new_token
+            original()
+            refreshes.append(new_token)
+
+        self.tokens.refresh = tracked
+        return refreshes
+
+    _MESSAGE = {
+        "model": "databricks-glm-5-2",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+
+    def test_a_401_is_retried_once_with_a_force_refreshed_token(self):
+        _StubGateway.statuses = [401]
+        refreshes = self._track_refresh()
+
+        status, body = self._post("/v1/messages", self._MESSAGE)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body["content"][0]["text"], "hi")
+        self.assertEqual(refreshes, ["refreshed-token"])
+        self.assertEqual(
+            _StubGateway.seen_authorizations,
+            ["Bearer stub-token", "Bearer refreshed-token"],
+        )
+
+    def test_a_403_is_retried_too(self):
+        _StubGateway.statuses = [403]
+        refreshes = self._track_refresh()
+
+        status, _ = self._post("/v1/messages", self._MESSAGE)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(refreshes, ["refreshed-token"])
+
+    def test_a_persistent_401_is_reported_after_exactly_one_retry(self):
+        _StubGateway.statuses = [401, 401, 401]
+        refreshes = self._track_refresh()
+
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._post("/v1/messages", self._MESSAGE)
+
+        self.assertEqual(ctx.exception.code, 401)
+        # One retry, not a loop: the gateway saw exactly two attempts.
+        self.assertEqual(len(_StubGateway.seen_authorizations), 2)
+        self.assertEqual(refreshes, ["refreshed-token"])
+        # The gateway's own message reaches Claude Code as an Anthropic error.
+        self.assertEqual(
+            json.loads(ctx.exception.read().decode("utf-8"))["error"]["message"],
+            "token expired or invalid",
+        )
+
+    def test_a_non_auth_error_is_not_retried(self):
+        _StubGateway.statuses = [500]
+        refreshes = self._track_refresh()
+
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._post("/v1/messages", self._MESSAGE)
+
+        self.assertEqual(ctx.exception.code, 500)
+        self.assertEqual(len(_StubGateway.seen_authorizations), 1)
+        self.assertEqual(refreshes, [])
+
+    def test_a_dead_oauth_session_still_relays_the_gateways_own_error(self):
+        """`refresh()` raising means the OAuth session itself is gone, not just
+        the access token. Retry anyway with what we have, so the caller sees the
+        gateway's status rather than a shim-invented one."""
+        _StubGateway.statuses = [401, 401]
+
+        def dead() -> None:
+            raise RuntimeError("databricks auth token failed")
+
+        self.tokens.refresh = dead
+
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._post("/v1/messages", self._MESSAGE)
+
+        self.assertEqual(ctx.exception.code, 401)
+        self.assertEqual(len(_StubGateway.seen_authorizations), 2)
