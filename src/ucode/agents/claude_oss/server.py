@@ -117,18 +117,40 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         return  # never log request lines; they can carry paths
 
-    def _send_json(self, status: int, payload: dict) -> None:
+    def _send_json(self, status: int, payload: dict, *, close: bool = False) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if close:
+            # BaseHTTPRequestHandler.send_header also flips close_connection for
+            # this one, so the socket is torn down after the response is flushed.
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
     def _send_error(self, status: int, message: str) -> None:
+        """Report an error and close the connection.
+
+        `protocol_version = "HTTP/1.1"` makes keep-alive the default, but two
+        error paths answer without having consumed the request body: the
+        unknown-path 404 in `do_POST` (which runs before any read happens) and
+        the 413 in `_read_body` (which refuses to read an oversized body at all).
+        Those unread bytes are then parsed as the start of the next request on
+        the same connection, desyncing every request after it — a corrupted
+        session, not a clean failure.
+
+        Closing on every error response, rather than only on those two, is the
+        cheaper correctness argument: error responses are rare, so nothing is
+        lost, and no future error path can reintroduce the desync by forgetting
+        to drain. Success responses are untouched and stay kept-alive.
+        """
         self.trace("error", {"status": status, "message": message})
+        # Set here as well as via the header, so a write that fails partway
+        # still leaves the connection marked for teardown.
+        self.close_connection = True
         try:
-            self._send_json(status, translate.error_body(status, message))
+            self._send_json(status, translate.error_body(status, message), close=True)
         except OSError:
             pass
 
