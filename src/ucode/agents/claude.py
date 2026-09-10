@@ -743,12 +743,19 @@ def write_tool_config(
     # would otherwise carry a stale claude_oss_fallback=True forever, and
     # claude.launch() would silently dispatch to _launch_oss_shim (clobbering
     # the provider/managed settings.json we just wrote) instead of using it.
-    # A provider, a relay, or a real model — resolved, managed, or custom —
-    # standing in here means this write is NOT the OSS shim's own (that call,
-    # from _launch_oss_shim, passes none of these — only oss_shim_base_url
-    # and provider_models), so it's safe and correct to drop the stale flag.
+    # A provider, a relay, a real model — resolved, managed, or custom — or a
+    # managed config's own per-family pins (coding_agent_config_defaults, which
+    # a manifest can supply without also setting default_model) standing in
+    # here means this write is NOT the OSS shim's own (that call, from
+    # _launch_oss_shim, passes none of these — only oss_shim_base_url and
+    # provider_models), so it's safe and correct to drop the stale flag.
     if oss_shim_base_url is None and (
-        provider or relayed or model or route_root_model or custom_model
+        provider
+        or relayed
+        or model
+        or route_root_model
+        or custom_model
+        or coding_agent_config_defaults
     ):
         state.pop("claude_oss_fallback", None)
     state = mark_tool_managed(state, "claude", managed_keys)

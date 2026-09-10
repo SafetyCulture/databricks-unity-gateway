@@ -1284,6 +1284,52 @@ class TestWriteToolConfigClearsStaleOssFallback:
 
         assert result.get("claude_oss_fallback") is not True
 
+    def test_managed_config_defaults_alone_clears_a_stale_flag(self, monkeypatch):
+        """Closes a further gap found on re-review: a manifest can supply
+        Claude's per-family models purely via coding_agent_config_defaults
+        without also setting default_model — schema-valid whenever claude
+        isn't the manifest's default_agent, and reachable via
+        `ucode publish -f <file>` (not just the interactive wizard, which
+        always pairs the two). That call has provider/relayed/model/
+        route_root_model/custom_model all falsy, so only
+        coding_agent_config_defaults distinguishes it from the OSS shim's own
+        write."""
+        self._patch(monkeypatch)
+        state = {"workspace": WS, "claude_models": {}, "claude_oss_fallback": True}
+
+        result = claude.write_tool_config(
+            state,
+            None,
+            coding_agent_config_defaults={"opus": "databricks-claude-opus-4-8"},
+        )
+
+        assert result.get("claude_oss_fallback") is not True
+
+    def test_launch_after_a_managed_defaults_only_configure_does_not_dispatch_to_the_oss_shim(
+        self, monkeypatch
+    ):
+        """End to end for the coding_agent_config_defaults-only scenario,
+        mirroring the provider-configure launch test above."""
+        self._patch(monkeypatch)
+        state = {"workspace": WS, "claude_models": {}, "claude_oss_fallback": True}
+        state = claude.write_tool_config(
+            state,
+            None,
+            coding_agent_config_defaults={"opus": "databricks-claude-opus-4-8"},
+        )
+        assert state.get("claude_oss_fallback") is not True
+
+        oss_shim_calls: list = []
+        exec_calls: list = []
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
+        monkeypatch.setattr(claude, "_launch_oss_shim", lambda *a, **k: oss_shim_calls.append(a))
+        monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: exec_calls.append(argv))
+
+        claude.launch(state, ["--debug"], options=LaunchOptions())
+
+        assert oss_shim_calls == []
+        assert exec_calls  # reached the normal (non-shim) dispatch instead
+
     def test_the_oss_shims_own_configure_write_keeps_the_flag(self, monkeypatch):
         """Regression guard for the critical failure mode a naive fix would
         introduce: both `_launch_oss_shim`'s own write and the pre-launch
