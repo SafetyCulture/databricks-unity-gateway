@@ -729,7 +729,10 @@ def write_tool_config(
         lambda base: _compose(base, enforce_model_default_hierarchy=True),
         managed_file_keys,
         relayed,
-        oss_shim=oss_shim_base_url is not None,
+        # Truthiness, not `is not None`, so this agrees with the two places that
+        # decide the actual behaviour: render_overlay's `elif oss_shim_base_url`
+        # and _compose's apiKeyHelper pop.
+        oss_shim=bool(oss_shim_base_url),
     )
 
     if web_search_model:
