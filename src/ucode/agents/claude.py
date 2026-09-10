@@ -1507,6 +1507,12 @@ def _launch_oss_shim(state: dict, binary: str, tool_args: list[str]) -> None:
             "ANTHROPIC_DEFAULT_OPUS_MODEL": opus_model,
             "ANTHROPIC_DEFAULT_SONNET_MODEL": sonnet_model,
             "ANTHROPIC_DEFAULT_HAIKU_MODEL": haiku_model,
+            # Always on for OSS-fallback, unlike the opt-in --enable-model-discovery
+            # flag on the normal (non-shim) Claude path: the shim's own /v1/models
+            # route (Handler.do_GET) exists specifically to serve this, so there is
+            # no reason to hide the full GLM/Kimi/... catalogue behind a flag when
+            # the shim is already running and translating every request anyway.
+            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
         }
     )
 

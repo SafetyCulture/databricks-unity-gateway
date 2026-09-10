@@ -1413,6 +1413,42 @@ class TestClaudeLaunch:
             assert key not in started["env"], f"{key} must not reach the Claude Code child"
         assert started["env"]["SOME_UNRELATED_VAR"] == "keep-me"
 
+    def test_launch_oss_shim_enables_gateway_model_discovery(self, monkeypatch, tmp_path):
+        """OSS-fallback launches always turn on Claude Code's native
+        CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY, unconditionally (not gated
+        behind the opt-in --enable-model-discovery flag that the normal,
+        non-shim Claude path uses) - the shim's own /v1/models endpoint exists
+        specifically to serve this, and there is no reason to hide the full
+        catalogue behind a flag when the shim is already running."""
+        state = {
+            "workspace": "https://example.cloud.databricks.com",
+            "oss_models": ["databricks-glm-5-2", "databricks-kimi-k3"],
+        }
+        started = {}
+
+        class FakeProc:
+            returncode = 0
+
+            def wait(self):
+                return 0
+
+        def fake_popen(argv, **kwargs):
+            started["env"] = kwargs.get("env")
+            return FakeProc()
+
+        monkeypatch.setattr(claude.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *a, **k: "fake-token")
+        monkeypatch.setattr(
+            claude.gateway_proxy, "get_databricks_token", lambda *a, **k: "fake-token"
+        )
+        monkeypatch.setattr(claude, "write_tool_config", lambda *a, **k: {})
+        monkeypatch.delenv("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", raising=False)
+
+        with pytest.raises(SystemExit):
+            claude._launch_oss_shim(state, "claude", [])
+
+        assert started["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
+
     def test_launch_oss_shim_omits_the_1m_suffix_for_a_smaller_context_model(
         self, monkeypatch, tmp_path
     ):
