@@ -208,6 +208,8 @@ def managed_file_status(
             status = "compatible (local settings)"
         elif scope == "relay-compatible":
             status = "compatible (relay settings)"
+        elif scope == "oss-shim-compatible":
+            status = "compatible (OSS shim settings)"
         else:
             status = "current"
     else:
