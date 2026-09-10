@@ -61,6 +61,7 @@ from ucode.databricks import (
     is_model_provider_feature_unavailable,
     list_profile_entries,
     list_tool_provider_services,
+    newest,
     normalize_workspace_url,
     probe_unity_gateway_capabilities,
     resolve_pat_token,
@@ -430,6 +431,7 @@ def configure_shared_state(
     databricks_ai_tools_enabled: bool | None = None,
     custom_oauth: CustomOAuthConfig | None = None,
     clear_custom_oauth: bool = False,
+    no_oss_fallback: bool = False,
 ) -> dict:
     """Log into Databricks, verify AI Gateway, fetch model lists, persist state.
 
@@ -449,6 +451,16 @@ def configure_shared_state(
     in ``_launch_tool``) and the gateway was verified by that earlier configure.
     Only the local profile resolution and the shared state assembly still run;
     the saved model lists are preserved.
+    ``fable_enabled`` opts the premium Claude Fable family into Claude Code's
+    ``ANTHROPIC_DEFAULT_FABLE_MODEL`` pin (default off). ``None`` means "inherit":
+    a launch re-run keeps whatever the workspace was configured with; ``True``/
+    ``False`` come from an explicit ``configure --enable-fable``/``--disable-fable``.
+    ``no_oss_fallback`` is the escape hatch for a caller (e.g. a script pinned to
+    a specific Claude version) that wants the normal "no models available" error
+    instead of a silent launch against the OSS translation shim: unlike
+    ``fable_enabled`` it is not persisted, so it must be passed on every call
+    (``ug claude --no-oss-fallback``) where the caller wants it to apply — see
+    ``claude_cmd``/``_launch_tool``/``_auto_configure_tool``.
     """
     workspace = normalize_workspace_url(workspace)
     prior_state = load_state()
@@ -634,9 +646,13 @@ def configure_shared_state(
             state["oss_models"] = oss_models
         # No Claude models but some OSS models (GLM, Kimi, ...) means `ucode
         # claude` should run against the translation shim instead of failing
-        # outright — see `claude.py`'s `_launch_oss_shim`/`launch()`.
+        # outright — see `claude.py`'s `_launch_oss_shim`/`launch()`. An explicit
+        # `--no-oss-fallback` (no_oss_fallback) overrides that and forces the
+        # normal "no models available" error instead.
         if want_claude:
-            state["claude_oss_fallback"] = not claude_models and bool(oss_models)
+            state["claude_oss_fallback"] = (
+                not no_oss_fallback and not claude_models and bool(oss_models)
+            )
         if fetch_all or "opencode" in tools:
             state["opencode_models"] = opencode_models
     save_state(state)
@@ -689,7 +705,18 @@ def _configure_shared_workspace_states(
 def _provider_summary(tool: str, state: dict) -> str:
     """Short label for the Configuration Complete box: 'Databricks' when no
     Model Provider Service is configured, otherwise the external provider type
-    backing this tool (claude routes to Anthropic, codex to OpenAI)."""
+    backing this tool (claude routes to Anthropic, codex to OpenAI). A claude
+    launch running against the OSS translation shim instead (no Claude models
+    on the workspace — `claude_oss_fallback`, see `configure_shared_state`)
+    names the two active OSS models rather than the generic 'Databricks' label,
+    since 'Databricks' alone would hide that a different model family is
+    actually answering."""
+    if tool == "claude" and state.get("claude_oss_fallback"):
+        oss_models = state.get("oss_models") or []
+        glm = newest(oss_models, "glm")
+        kimi = newest(oss_models, "kimi")
+        names = ", ".join(m for m in (glm, kimi) if m)
+        return f"Databricks OSS shim ({names})" if names else "Databricks OSS shim"
     if not get_provider_service(state, tool):
         return "Databricks"
     return {"claude": "Anthropic", "codex": "OpenAI"}.get(tool, "Model Provider Service")
@@ -1716,11 +1743,19 @@ def claude_router_hook_cmd(
         sys.stdout.write(json.dumps(output))
 
 
-def _auto_configure_tool(tool: str, custom_oauth: CustomOAuthConfig | None = None) -> None:
+def _auto_configure_tool(
+    tool: str, custom_oauth: CustomOAuthConfig | None = None, *, no_oss_fallback: bool = False
+) -> None:
     """Configure a tool for launch without sending a separate validation prompt.
 
     The real agent session follows immediately; explicit configure retains the
     test-prompt validation.
+
+    ``no_oss_fallback`` is forwarded from ``_launch_tool`` so a first-run `ug
+    claude --no-oss-fallback` (no prior `ug configure`) fails this cold-start
+    configure with the normal "not available" error instead of quietly
+    configuring the OSS shim here and then erroring only on the launch call
+    that follows — see ``configure_shared_state``.
     """
     existing = load_state()
     workspace = existing.get("workspace")
@@ -1728,7 +1763,13 @@ def _auto_configure_tool(tool: str, custom_oauth: CustomOAuthConfig | None = Non
     if not workspace:
         workspace, profile = _prompt_for_configuration(tool)
     configure_kwargs = {"custom_oauth": custom_oauth} if custom_oauth is not None else {}
-    state = configure_shared_state(workspace, profile=profile, tools=[tool], **configure_kwargs)
+    state = configure_shared_state(
+        workspace,
+        profile=profile,
+        tools=[tool],
+        no_oss_fallback=no_oss_fallback,
+        **configure_kwargs,
+    )
 
     state = configure_single_tool(tool, state)
 
@@ -2024,6 +2065,7 @@ def _launch_tool(
     model: str | None = None,
     parent_schema: str | None = None,
     custom_oauth: CustomOAuthConfig | None = None,
+    no_oss_fallback: bool = False,
 ) -> None:
     try:
         tool = normalize_tool(tool_name)
@@ -2062,9 +2104,11 @@ def _launch_tool(
         ensure_bootstrap_dependencies(tool)
         if needs_auto_configure:
             if custom_oauth is None:
-                _auto_configure_tool(tool)
+                _auto_configure_tool(tool, no_oss_fallback=no_oss_fallback)
             else:
-                _auto_configure_tool(tool, custom_oauth=custom_oauth)
+                _auto_configure_tool(
+                    tool, custom_oauth=custom_oauth, no_oss_fallback=no_oss_fallback
+                )
         state = ensure_provider_state(tool)
         # Remembered before the fallback below collapses the two cases: a managed config may not
         # silently override a provider the user typed on the command line (it errors instead).
@@ -2096,6 +2140,7 @@ def _launch_tool(
             tools=[tool],
             skip_model_discovery=bool(provider) or managed_models_known,
             skip_preflight=skip_preflight,
+            no_oss_fallback=no_oss_fallback,
             **configure_kwargs,
         )
         # An admin-published managed config wins over the developer's own settings. Layered on after
@@ -2635,6 +2680,17 @@ def claude_cmd(
             help="Disable smart routing and remove ug's Claude Code routing hooks.",
         ),
     ] = False,
+    no_oss_fallback: Annotated[
+        bool,
+        typer.Option(
+            "--no-oss-fallback",
+            help="Fail with the normal 'no models available' error instead of "
+            "falling back to the OSS translation shim (GLM, Kimi, ...) when the "
+            "workspace has no Claude models. For scripts that need a specific "
+            "Claude version rather than a silently different model. Not "
+            "persisted — pass it on every invocation that needs it.",
+        ),
+    ] = False,
 ) -> None:
     """Launch Claude Code via Databricks."""
     try:
@@ -2663,6 +2719,7 @@ def claude_cmd(
                 workspace_url=workspace,
                 parent_schema=parent,
                 custom_oauth=custom_oauth,
+                no_oss_fallback=no_oss_fallback,
             )
 
 
