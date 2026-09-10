@@ -163,10 +163,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error(413, "Request body too large.")
             return None
         try:
-            return json.loads(self.rfile.read(length).decode("utf-8"))
+            parsed = json.loads(self.rfile.read(length).decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             self._send_error(400, "Request body was not valid JSON.")
             return None
+        # Both endpoints treat the body as a mapping (`body.get(...)`), so a bare
+        # list or string has to be rejected here rather than raising downstream.
+        if not isinstance(parsed, dict):
+            self._send_error(400, "Request body must be a JSON object.")
+            return None
+        return parsed
 
     def _open_upstream(self, payload: dict, *, stream: bool):
         url = f"{self.host.rstrip('/')}{OSS_ROUTE}"
@@ -242,19 +248,35 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_body()
         if body is None:
             return
-        self._send_json(200, {"input_tokens": translate.count_tokens(body)})
+        try:
+            estimate = translate.count_tokens(body)
+        except Exception as exc:  # noqa: BLE001 - see _messages
+            self._send_error(400, f"Could not measure the request: {type(exc).__name__}: {exc}")
+            return
+        self._send_json(200, {"input_tokens": estimate})
 
     def _messages(self) -> None:
         body = self._read_body()
         if body is None:
             return
-        model = self.router.resolve(body.get("model"))
-        payload = translate.anthropic_to_openai(
-            body,
-            model=model,
-            max_output=_max_output_for(model),
-            allow_images=self.allow_images and supports_vision(model),
-        )
+        # The translators assume Anthropic's shapes: `_convert_messages` iterates
+        # `messages` and calls `.get` on each element, so a bare string is walked
+        # character by character and raises AttributeError. BaseHTTPRequestHandler
+        # turns nothing into a response, so the connection would simply drop
+        # mid-turn. Catch broadly and answer 400: the request is unusable either
+        # way, and a clean Anthropic error body is something Claude Code can
+        # report, whereas a dropped socket is not.
+        try:
+            model = self.router.resolve(body.get("model"))
+            payload = translate.anthropic_to_openai(
+                body,
+                model=model,
+                max_output=_max_output_for(model),
+                allow_images=self.allow_images and supports_vision(model),
+            )
+        except Exception as exc:  # noqa: BLE001 - malformed input must not drop the connection
+            self._send_error(400, f"Could not translate the request: {type(exc).__name__}: {exc}")
+            return
         self.trace("request", {"model_requested": body.get("model"), "upstream": payload})
         if body.get("stream"):
             self._stream(payload, model)
