@@ -1232,6 +1232,100 @@ class TestClaudeLaunch:
         assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"]]
 
 
+class TestWriteToolConfigClearsStaleOssFallback:
+    """`claude_oss_fallback` is only ever recomputed by `configure_shared_state`'s
+    full discovery, which a provider/managed-config launch skips entirely
+    (`skip_model_discovery`). A workspace that once had no Claude models could
+    therefore carry a stale `claude_oss_fallback=True` forever, and
+    `claude.launch()` would keep dispatching to `_launch_oss_shim` — silently
+    clobbering the provider/managed settings.json this call is writing — long
+    after a provider or a real (managed) model made the shim unnecessary.
+    `write_tool_config` must drop the stale flag whenever it's given something
+    that stands in for it (a provider, a relay, or a real model), but must
+    NOT drop it on the one write shape that means "still on the shim path":
+    `_launch_oss_shim`'s own write, and the pre-launch write that precedes it,
+    both call this with model=None, provider=None, relayed=False."""
+
+    @staticmethod
+    def _patch(monkeypatch):
+        monkeypatch.setattr(claude, "backup_existing_file", lambda *a, **kw: True)
+        monkeypatch.setattr(claude, "read_json_safe", lambda path: {})
+        monkeypatch.setattr(claude, "write_json_file", lambda *a, **kw: None)
+        monkeypatch.setattr(claude, "save_state", lambda state: None)
+
+    def test_a_provider_configure_clears_a_stale_flag(self, monkeypatch):
+        self._patch(monkeypatch)
+        state = {"workspace": WS, "claude_models": {}, "claude_oss_fallback": True}
+
+        result = claude.write_tool_config(state, None, provider="my-provider-service")
+
+        assert result.get("claude_oss_fallback") is not True
+
+    def test_a_real_managed_model_configure_clears_a_stale_flag(self, monkeypatch):
+        """Closes a gap a literal "clear when provider or relayed" fix would
+        have missed: an admin-managed config that supplies a real Claude
+        model with NO provider service is also not the OSS shim."""
+        self._patch(monkeypatch)
+        state = {"workspace": WS, "claude_models": {}, "claude_oss_fallback": True}
+
+        result = claude.write_tool_config(state, "databricks-claude-opus-4-8")
+
+        assert result.get("claude_oss_fallback") is not True
+
+    def test_a_route_root_model_configure_clears_a_stale_flag(self, monkeypatch):
+        """A managed/smart-routing pick delivered via route_root_model (rather
+        than the positional `model`) is just as real a non-shim config."""
+        self._patch(monkeypatch)
+        state = {"workspace": WS, "claude_models": {}, "claude_oss_fallback": True}
+
+        result = claude.write_tool_config(
+            state, None, route_root_model="databricks-claude-opus-4-8"
+        )
+
+        assert result.get("claude_oss_fallback") is not True
+
+    def test_the_oss_shims_own_configure_write_keeps_the_flag(self, monkeypatch):
+        """Regression guard for the critical failure mode a naive fix would
+        introduce: both `_launch_oss_shim`'s own write and the pre-launch
+        write inside `_launch_tool` that precedes it call this with
+        model=None, provider=None, relayed=False — clearing the flag here
+        would pull it out from under the very launch it's meant to enable,
+        because `claude.launch()` reads it right after this returns."""
+        self._patch(monkeypatch)
+        state = {"workspace": WS, "claude_models": {}, "claude_oss_fallback": True}
+
+        result = claude.write_tool_config(
+            state,
+            None,
+            provider_models={"opus": "databricks-glm-5-2", "sonnet": "databricks-kimi-k3"},
+            oss_shim_base_url="http://127.0.0.1:12345",
+        )
+
+        assert result.get("claude_oss_fallback") is True
+
+    def test_launch_after_a_provider_configure_does_not_dispatch_to_the_oss_shim(self, monkeypatch):
+        """End to end: the exact staleness sequence the reviewer described —
+        claude_oss_fallback=True persisted from a prior OSS-fallback
+        discovery, then a provider configure — must make the very next
+        `claude.launch()` skip `_launch_oss_shim` entirely, not just clear
+        the flag in isolation."""
+        self._patch(monkeypatch)
+        state = {"workspace": WS, "claude_models": {}, "claude_oss_fallback": True}
+        state = claude.write_tool_config(state, None, provider="my-provider-service")
+        assert state.get("claude_oss_fallback") is not True
+
+        oss_shim_calls: list = []
+        exec_calls: list = []
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
+        monkeypatch.setattr(claude, "_launch_oss_shim", lambda *a, **k: oss_shim_calls.append(a))
+        monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: exec_calls.append(argv))
+
+        claude.launch(state, ["--debug"], options=LaunchOptions())
+
+        assert oss_shim_calls == []
+        assert exec_calls  # reached the normal (non-shim) dispatch instead
+
+
 class TestWriteToolConfigPrunesStaleModelEnv:
     """Stale ucode-managed model env keys (ANTHROPIC_MODEL, etc.) from earlier
     ucode versions must be removed on every launch — otherwise they linger in

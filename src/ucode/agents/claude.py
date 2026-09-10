@@ -737,6 +737,20 @@ def write_tool_config(
     else:
         state.pop("claude_relayed", None)
         state.pop("relayed_proxy_port", None)
+    # claude_oss_fallback is only ever recomputed by configure_shared_state's
+    # full discovery — a provider/managed-config launch skips that discovery
+    # (skip_model_discovery), so a workspace that once had no Claude models
+    # would otherwise carry a stale claude_oss_fallback=True forever, and
+    # claude.launch() would silently dispatch to _launch_oss_shim (clobbering
+    # the provider/managed settings.json we just wrote) instead of using it.
+    # A provider, a relay, or a real model — resolved, managed, or custom —
+    # standing in here means this write is NOT the OSS shim's own (that call,
+    # from _launch_oss_shim, passes none of these — only oss_shim_base_url
+    # and provider_models), so it's safe and correct to drop the stale flag.
+    if oss_shim_base_url is None and (
+        provider or relayed or model or route_root_model or custom_model
+    ):
+        state.pop("claude_oss_fallback", None)
     state = mark_tool_managed(state, "claude", managed_keys)
     save_state(state)
     return state
