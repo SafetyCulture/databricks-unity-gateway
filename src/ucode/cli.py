@@ -2424,6 +2424,46 @@ def codex_cmd(
         )
 
 
+def _run_claude_oss_probe(workspace_url: str | None, model: str | None) -> int:
+    """Read-only diagnostic for `ucode claude --probe`: never writes state.json
+    or settings.json, only reads the already-configured workspace (or an
+    explicit `--workspace` override) and issues HTTP probes.
+
+    Mirrors the workspace/token resolution `ucode.usage.usage` uses for its
+    own standalone, read-only report (`load_state` + `apply_pat_environment` +
+    `ensure_databricks_auth` + `get_databricks_token`) rather than going
+    through `_launch_tool`, which auto-configures and persists state for a
+    workspace it hasn't seen before.
+    """
+    from ucode.agents.claude_oss.probe import run_probe
+
+    state = load_state()
+    workspace = normalize_workspace_url(workspace_url) if workspace_url else state.get("workspace")
+    if not workspace:
+        print_err("Workspace is not configured. Run `ucode configure` first, or pass --workspace.")
+        return 1
+    profile = state.get("profile")
+    apply_pat_environment(state)
+    try:
+        ensure_databricks_auth(workspace, profile)
+        with spinner("Retrieving Databricks access token..."):
+            token = get_databricks_token(workspace, profile)
+        with spinner("Discovering OSS models..."):
+            oss_models, reason = discover_oss_models(workspace, token)
+    except RuntimeError as exc:
+        print_err(str(exc))
+        return 1
+
+    # `workspace` itself is printed by run_probe below; profile and the OSS
+    # model list are known only here, before the model default is resolved.
+    print_kv("profile", profile or "(none)")
+    print_kv("oss models", ", ".join(oss_models) or "(none found)")
+    resolved_model = model or newest(oss_models, "glm") or newest(oss_models, "kimi")
+    if not resolved_model and reason:
+        print_note(f"OSS model discovery: {reason}")
+    return run_probe(workspace, token, resolved_model)
+
+
 @app.command(
     "claude",
     cls=_PromptAwareCommand,
@@ -2494,8 +2534,20 @@ def claude_cmd(
             "persisted — pass it on every invocation that needs it.",
         ),
     ] = False,
+    probe: Annotated[
+        bool,
+        typer.Option(
+            "--probe",
+            help="Diagnose the OSS translation shim instead of launching: check "
+            "whether the Anthropic-dialect route now accepts the OSS model "
+            "directly, and confirm the mlflow route's non-streaming/streaming/"
+            "tool-calling/max_tokens behavior. Read-only; writes nothing.",
+        ),
+    ] = False,
 ) -> None:
     """Launch Claude Code via Databricks."""
+    if probe:
+        raise typer.Exit(_run_claude_oss_probe(workspace, model))
     if enable_smart_routing_flag and disable_smart_routing_flag:
         print_err("Use only one of --enable-smart-routing or --disable-smart-routing.")
         raise typer.Exit(1)
