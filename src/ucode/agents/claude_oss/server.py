@@ -242,7 +242,10 @@ class Handler(BaseHTTPRequestHandler):
         return self._open_upstream(payload, stream=stream)
 
     def do_GET(self) -> None:  # noqa: N802
-        path = self.path.rstrip("/")
+        # Live-reproduced: the real Claude Code binary requests
+        # "/v1/models?limit=1000", not the bare path - strip the query string
+        # before matching, same as do_POST already does.
+        path = self.path.split("?", 1)[0].rstrip("/")
         # Traced unconditionally (GET carries no request body and the shim
         # discards whatever Authorization header Claude Code sends, so there's
         # nothing secret here) - this is the only way to tell, from a live

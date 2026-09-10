@@ -186,6 +186,13 @@ class TestModelsEndpoint(_ShimServerCase):
         _, body = self._get("/v1/models")
         assert body["has_more"] is False
 
+    def test_a_query_string_does_not_break_the_route_match(self):
+        # Live-reproduced: the real Claude Code binary requests
+        # "/v1/models?limit=1000", not the bare path.
+        status, body = self._get("/v1/models?limit=1000")
+        assert status == 200
+        assert [entry["id"] for entry in body["data"]] == ["databricks-glm-5-2"]
+
 
 class TestGetRequestTracing(unittest.TestCase):
     """CLAUDE_OSS_SHIM_LOG must record GET requests too, not just the /v1/messages
