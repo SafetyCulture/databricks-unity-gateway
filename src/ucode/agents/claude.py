@@ -682,9 +682,15 @@ def write_tool_config(
         merged["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY] = _merge_anthropic_custom_headers(
             existing_custom_headers, overlay_custom_headers
         )
-        # Drop any apiKeyHelper a prior non-relayed launch left in the file; relayed
-        # must not carry one (it would outrank the subscription OAuth).
-        if relayed:
+        # Drop any apiKeyHelper an earlier launch left in the file. render_overlay
+        # omits it on both credential-less paths, but deep_merge_dict keeps keys the
+        # file already has. Relayed must not carry one (it would outrank the
+        # subscription OAuth). The OSS shim must not either, and always finds one:
+        # the pre-launch `configure_tool` write runs before the shim's port exists,
+        # so it passes oss_shim_base_url=None and writes a real gateway helper.
+        # Leaving it makes Claude Code shell out to `databricks auth token` on a TTL
+        # and hand a live OAuth token to a loopback server that only discards it.
+        if relayed or oss_shim_base_url:
             merged.pop("apiKeyHelper", None)
         if tracing_env_vars and stop_hook_command:
             _upsert_tracing_stop_hook(merged, stop_hook_command)

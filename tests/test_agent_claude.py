@@ -1557,6 +1557,62 @@ class TestWriteToolConfigClearsStaleOssFallback:
         assert exec_calls  # reached the normal (non-shim) dispatch instead
 
 
+class TestWriteToolConfigPrunesStaleApiKeyHelper:
+    """`render_overlay` omits `apiKeyHelper` for both credential-less paths
+    (relayed and the OSS shim), but `deep_merge_dict` keeps whatever the file
+    already has — and on the OSS path the file always has one, written moments
+    earlier by the pre-launch `configure_tool` call, which runs before the shim's
+    port exists and so passes `oss_shim_base_url=None`. It has to be popped from
+    the merge result, not merely left out of the overlay."""
+
+    def _patch(self, monkeypatch, existing_settings):
+        monkeypatch.setattr(claude, "backup_existing_file", lambda *a, **kw: True)
+        monkeypatch.setattr(
+            claude, "read_json_safe", lambda path: json.loads(json.dumps(existing_settings))
+        )
+        written: dict = {}
+        monkeypatch.setattr(
+            claude, "write_json_file", lambda path, payload: written.update(payload=payload)
+        )
+        monkeypatch.setattr(claude, "save_state", lambda state: None)
+        monkeypatch.setattr(claude, "_register_web_search_mcp", lambda *a, **kw: True)
+        return written
+
+    def test_oss_shim_drops_the_helper_the_prelaunch_configure_left_behind(self, monkeypatch):
+        existing = {"apiKeyHelper": "databricks auth token --host ...", "env": {}}
+        written = self._patch(monkeypatch, existing)
+        state = {"workspace": WS, "claude_models": {}, "claude_oss_fallback": True}
+
+        claude.write_tool_config(
+            state,
+            None,
+            provider_models={"opus": "databricks-glm-5-2[1m]"},
+            oss_shim_base_url="http://127.0.0.1:54321",
+        )
+
+        assert "apiKeyHelper" not in written["payload"]
+
+    def test_a_normal_launch_still_writes_the_gateway_helper(self, monkeypatch):
+        written = self._patch(monkeypatch, {})
+        state = {"workspace": WS, "claude_models": {"opus": "databricks-claude-opus-4-8"}}
+
+        claude.write_tool_config(state, "databricks-claude-opus-4-8")
+
+        assert written["payload"]["apiKeyHelper"]
+
+    def test_relayed_drops_the_helper_too(self, monkeypatch):
+        """The pre-existing half of the same rule, pinned so the OR condition
+        can't be narrowed back to OSS-only."""
+        existing = {"apiKeyHelper": "databricks auth token --host ...", "env": {}}
+        written = self._patch(monkeypatch, existing)
+        monkeypatch.setattr(claude, "relayed_proxy_base_url", lambda state: "http://127.0.0.1:9999")
+        state = {"workspace": WS, "claude_models": {}}
+
+        claude.write_tool_config(state, None, relayed=True)
+
+        assert "apiKeyHelper" not in written["payload"]
+
+
 class TestWriteToolConfigPrunesStaleModelEnv:
     """Stale ucode-managed model env keys (ANTHROPIC_MODEL, etc.) from earlier
     ucode versions must be removed on every launch — otherwise they linger in
