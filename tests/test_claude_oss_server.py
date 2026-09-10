@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import threading
 import unittest
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from ucode.agents.claude_oss.server import ModelRouter, make_server
+from ucode.agents.claude_oss.server import MAX_BODY_BYTES, ModelRouter, make_server
 from ucode.gateway_proxy import TokenCache
 
 
@@ -172,6 +173,108 @@ class TestMessagesEndpoint(_ShimServerCase):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             self._post("/not-a-real-path", {})
         self.assertEqual(ctx.exception.code, 404)
+
+
+class TestErrorResponseFraming(_ShimServerCase):
+    """`protocol_version = "HTTP/1.1"` means keep-alive by default, but two error
+    paths answer without having consumed the request body: the unknown-path 404
+    in `do_POST` (which runs before any read) and the 413 in `_read_body` (which
+    refuses to read an oversized body at all). On a kept-alive connection those
+    unread bytes are then parsed as the start of the next request. Every error
+    response must therefore close the connection."""
+
+    _GOOD_BODY = json.dumps(
+        {
+            "model": "databricks-glm-5-2",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+    ).encode("utf-8")
+
+    def _connect(self) -> socket.socket:
+        sock = socket.create_connection(("127.0.0.1", self.server.server_address[1]), timeout=10)
+        self.addCleanup(sock.close)
+        return sock
+
+    @staticmethod
+    def _request(path: str, body: bytes, declared_length: int | None = None) -> bytes:
+        length = len(body) if declared_length is None else declared_length
+        return (
+            f"POST {path} HTTP/1.1\r\n"
+            f"Host: 127.0.0.1\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {length}\r\n"
+            f"\r\n"
+        ).encode() + body
+
+    @staticmethod
+    def _read_response(sock: socket.socket) -> tuple[bytes, bytes]:
+        """Read exactly one response: headers, then Content-Length bytes of body.
+
+        Deliberately not read-to-EOF — that could not tell a kept-alive
+        connection apart from a hung one.
+        """
+        buffer = b""
+        while b"\r\n\r\n" not in buffer:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buffer += chunk
+        head, _, body = buffer.partition(b"\r\n\r\n")
+        length = 0
+        for line in head.split(b"\r\n"):
+            if line.lower().startswith(b"content-length:"):
+                length = int(line.split(b":", 1)[1])
+        while len(body) < length:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            body += chunk
+        return head, body
+
+    def test_an_unknown_path_404_closes_the_connection(self):
+        sock = self._connect()
+        # Pipeline a perfectly valid request behind the bad one: on a kept-alive
+        # connection the 404's undrained body would be misparsed as its start.
+        sock.sendall(
+            self._request("/not-a-real-path", self._GOOD_BODY)
+            + self._request("/v1/messages", self._GOOD_BODY)
+        )
+
+        head, _ = self._read_response(sock)
+
+        self.assertIn(b" 404 ", head.split(b"\r\n", 1)[0])
+        self.assertIn(b"Connection: close", head)
+        self.assertEqual(sock.recv(4096), b"")
+
+    def test_an_oversized_body_413_closes_the_connection(self):
+        sock = self._connect()
+        # Declare more than MAX_BODY_BYTES but send only two: the server refuses
+        # without draining, so the connection cannot safely be reused.
+        sock.sendall(self._request("/v1/messages", b"{}", MAX_BODY_BYTES + 1))
+
+        head, _ = self._read_response(sock)
+
+        self.assertIn(b" 413 ", head.split(b"\r\n", 1)[0])
+        self.assertIn(b"Connection: close", head)
+        self.assertEqual(sock.recv(4096), b"")
+
+    def test_successful_responses_still_share_one_kept_alive_connection(self):
+        """The close must apply to errors only — Claude Code issues many
+        requests per session and reconnecting for each is pure latency."""
+        sock = self._connect()
+
+        sock.sendall(self._request("/v1/messages", self._GOOD_BODY))
+        first_head, first_body = self._read_response(sock)
+        self.assertIn(b" 200 ", first_head.split(b"\r\n", 1)[0])
+        self.assertNotIn(b"Connection: close", first_head)
+        self.assertEqual(json.loads(first_body)["content"][0]["text"], "hi")
+
+        # Same socket, second request: only possible if it stayed open.
+        sock.sendall(self._request("/v1/messages", self._GOOD_BODY))
+        second_head, second_body = self._read_response(sock)
+        self.assertIn(b" 200 ", second_head.split(b"\r\n", 1)[0])
+        self.assertEqual(json.loads(second_body)["content"][0]["text"], "hi")
 
 
 class TestUpstreamAuthRetry(_ShimServerCase):
