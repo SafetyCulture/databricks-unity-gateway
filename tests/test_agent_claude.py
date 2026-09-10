@@ -80,6 +80,43 @@ class TestMinimumVersion:
         assert claude.minimum_version_error() is None
 
 
+class TestOssLongContextSuffix:
+    """`_maybe_add_1m_suffix` matches a Claude-only regex, so it silently never
+    fires for an OSS id — leaving Claude Code on its assumed 200k default for a
+    1M-context model. `_oss_model_name` drives the decision off the context
+    window `ucode.databricks.model_token_limits` already records instead."""
+
+    def test_the_claude_only_regex_does_not_match_oss_ids(self):
+        # The reason this fix is needed at all, asserted so a future regex
+        # change can't quietly make the OSS helper look redundant.
+        assert claude._CLAUDE_MODEL_RE.match("databricks-glm-5-2") is None
+        assert claude._CLAUDE_MODEL_RE.match("databricks-kimi-k3") is None
+
+    def test_a_1m_context_oss_model_gets_the_suffix(self):
+        assert claude._oss_model_name("databricks-glm-5-2") == "databricks-glm-5-2[1m]"
+        assert claude._oss_model_name("databricks-kimi-k3") == "databricks-kimi-k3[1m]"
+
+    def test_a_smaller_context_oss_model_does_not(self):
+        # 128k per the model_token_limits `kimi` family entry.
+        assert claude._oss_model_name("databricks-kimi-k2-7-code") == "databricks-kimi-k2-7-code"
+        assert claude._oss_model_name("databricks-inkling-1") == "databricks-inkling-1"
+
+    def test_an_unknown_oss_model_does_not(self):
+        # No known limits means no claim about the window.
+        assert claude._oss_model_name("databricks-mystery-1") == "databricks-mystery-1"
+
+    def test_an_already_suffixed_id_is_not_doubled(self):
+        assert claude._oss_model_name("databricks-glm-5-2[1m]") == "databricks-glm-5-2[1m]"
+
+    def test_real_claude_ids_keep_the_existing_helpers_behaviour(self):
+        # Other callers (render_overlay, smart routing v2) depend on this.
+        assert (
+            claude._maybe_add_1m_suffix("databricks-claude-opus-4-8")
+            == "databricks-claude-opus-4-8[1m]"
+        )
+        assert claude._maybe_add_1m_suffix("databricks-glm-5-2") == "databricks-glm-5-2"
+
+
 class TestRenderOverlay:
     def test_long_context_suffix_supports_major_only_claude_versions(self):
         assert claude._maybe_add_1m_suffix("system.ai.claude-sonnet-5") == (
@@ -1225,15 +1262,60 @@ class TestClaudeLaunch:
         monkeypatch.setattr(
             claude.gateway_proxy, "get_databricks_token", lambda *a, **k: "fake-token"
         )
-        monkeypatch.setattr(claude, "write_tool_config", lambda *a, **k: {})
+        written: list = []
+        monkeypatch.setattr(claude, "write_tool_config", lambda *a, **k: written.append(k) or {})
 
         with pytest.raises(SystemExit) as exc:
             claude._launch_oss_shim(state, "claude", [])
 
         assert exc.value.code == 0
         assert started["env"]["ANTHROPIC_BASE_URL"].startswith("http://127.0.0.1:")
-        assert started["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"].startswith("databricks-glm-5-2")
-        assert started["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"].startswith("databricks-kimi-k3")
+        # Exact ids, suffix included: GLM and Kimi K3 are both 1M-context, and the
+        # `[1m]` suffix is the only thing that tells Claude Code so (it assumes
+        # 200k otherwise and auto-compacts five times too early).
+        assert started["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "databricks-glm-5-2[1m]"
+        assert started["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-kimi-k3[1m]"
+        assert started["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "databricks-glm-5-2[1m]"
+        # The same ids reach the settings file Claude Code reads.
+        assert written[0]["provider_models"] == {
+            "opus": "databricks-glm-5-2[1m]",
+            "sonnet": "databricks-kimi-k3[1m]",
+            "haiku": "databricks-glm-5-2[1m]",
+        }
+
+    def test_launch_oss_shim_omits_the_1m_suffix_for_a_smaller_context_model(
+        self, monkeypatch, tmp_path
+    ):
+        """A workspace whose only Kimi is the 128k K2 must not be advertised as
+        1M — the suffix is a claim about the window, not decoration."""
+        state = {
+            "workspace": "https://example.cloud.databricks.com",
+            "oss_models": ["databricks-glm-5-2", "databricks-kimi-k2-7-code"],
+        }
+        started = {}
+
+        class FakeProc:
+            returncode = 0
+
+            def wait(self):
+                return 0
+
+        def fake_popen(argv, **kwargs):
+            started["env"] = kwargs.get("env")
+            return FakeProc()
+
+        monkeypatch.setattr(claude.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *a, **k: "fake-token")
+        monkeypatch.setattr(
+            claude.gateway_proxy, "get_databricks_token", lambda *a, **k: "fake-token"
+        )
+        monkeypatch.setattr(claude, "write_tool_config", lambda *a, **k: {})
+
+        with pytest.raises(SystemExit):
+            claude._launch_oss_shim(state, "claude", [])
+
+        assert started["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "databricks-glm-5-2[1m]"
+        assert started["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-kimi-k2-7-code"
 
     def test_smart_routing_on_windows_is_not_supported(self, monkeypatch):
         monkeypatch.setenv(v2.ENV_VAR, "1")

@@ -30,6 +30,7 @@ from ucode.databricks import (
     build_auth_shell_command,
     build_tool_base_url,
     get_databricks_token,
+    model_token_limits,
     newest,
 )
 from ucode.launcher import exec_or_spawn
@@ -1351,6 +1352,28 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     raise SystemExit(returncode)
 
 
+# A context window at or above this earns Claude Code's `[1m]` name suffix.
+_LONG_CONTEXT_TOKENS = 1_000_000
+
+
+def _oss_model_name(model: str) -> str:
+    """The name to pin for an OSS model, with `[1m]` when it really is 1M-context.
+
+    `_maybe_add_1m_suffix` cannot be reused here: it matches `_CLAUDE_MODEL_RE`
+    (`claude-(opus|sonnet)-<version>`), so every OSS id falls through unsuffixed
+    and Claude Code keeps assuming its 200k default — auto-compacting five times
+    earlier than needed on GLM and Kimi K3, which are both 1M. Drive the decision
+    off the context window `ucode.databricks.model_token_limits` already records
+    per family rather than a second hand-maintained id list; an id with no known
+    limits makes no claim and stays bare."""
+    if model.endswith("[1m]"):
+        return model
+    limits = model_token_limits(model)
+    if limits and limits["context"] >= _LONG_CONTEXT_TOKENS:
+        return f"{model}[1m]"
+    return model
+
+
 def _launch_oss_shim(state: dict, binary: str, tool_args: list[str]) -> None:
     """OSS-model launch: the workspace has no Claude models but does have OSS
     chat models (GLM, Kimi, ...) on the mlflow gateway route. Start the local
@@ -1376,10 +1399,10 @@ def _launch_oss_shim(state: dict, binary: str, tool_args: list[str]) -> None:
     refresher = threading.Thread(target=tokens.run_refresher, daemon=True)
     refresher.start()
 
-    base_url = f"http://127.0.0.1:{bound_port}"
-    opus_model = _maybe_add_1m_suffix(glm)
-    sonnet_model = _maybe_add_1m_suffix(kimi)
-    haiku_model = _maybe_add_1m_suffix(glm)
+    base_url = f"http://{LOOPBACK_HOST}:{bound_port}"
+    opus_model = _oss_model_name(glm)
+    sonnet_model = _oss_model_name(kimi)
+    haiku_model = _oss_model_name(glm)
 
     write_tool_config(
         state,
