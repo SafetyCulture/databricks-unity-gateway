@@ -954,6 +954,14 @@ def status() -> int:
         provider_service = get_provider_service(state, tool)
         if configured and provider_service:
             print_kv("Model Provider Service", provider_service)
+        elif configured and tool == "claude" and state.get("claude_oss_fallback"):
+            # No Model Provider Service here — this is the OSS shim fallback
+            # (see configure_shared_state), which get_provider_service can't see
+            # since it isn't a provider_services entry. Without this, a `ug
+            # status` run after a fallback launch would show nothing at all for
+            # claude's provider, hiding that it's answering from GLM/Kimi
+            # instead of a real Claude model.
+            print_kv("Provider", _provider_summary(tool, state))
         print_kv("Base URL", base_url)
         if configured and tool in MCP_CLIENTS:
             tool_mcp_servers = [

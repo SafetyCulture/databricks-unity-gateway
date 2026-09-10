@@ -1244,6 +1244,51 @@ class TestStatus:
         assert result.exit_code == 0, result.output
         assert "Workspace-managed config" not in result.output
 
+    def test_shows_oss_shim_label_when_claude_fallback_is_active(self):
+        """A standalone `ug status` run (a separate invocation, after an
+        earlier fallback launch) must still be able to tell the fallback
+        happened — get_provider_service alone can't show this, since the OSS
+        shim isn't a provider_services entry."""
+        state = {
+            **MINIMAL_STATE,
+            "claude_models": {},
+            "claude_oss_fallback": True,
+            "oss_models": ["databricks-glm-5-2", "databricks-kimi-k3"],
+        }
+        with patch("ucode.cli.load_state", return_value=state):
+            result = runner.invoke(app, ["status"])
+
+        assert result.exit_code == 0, result.output
+        output = _strip_ansi(result.output)
+        assert "Provider: Databricks OSS shim (databricks-glm-5-2, databricks-kimi-k3)" in output
+
+    def test_hides_oss_shim_label_when_fallback_not_active(self):
+        with patch("ucode.cli.load_state", return_value=MINIMAL_STATE):
+            result = runner.invoke(app, ["status"])
+
+        assert result.exit_code == 0, result.output
+        assert "Databricks OSS shim" not in result.output
+
+    def test_model_provider_service_still_wins_over_oss_shim_label(self):
+        """provider_services and claude_oss_fallback aren't expected to coexist
+        in practice (write_tool_config's stale-flag clearing drops
+        claude_oss_fallback whenever a provider is set), but if state ever has
+        both, the existing Model Provider Service line must still win rather
+        than being silently replaced."""
+        state = {
+            **MINIMAL_STATE,
+            "provider_services": {"claude": "system.ai.anthropic"},
+            "claude_oss_fallback": True,
+            "oss_models": ["databricks-glm-5-2"],
+        }
+        with patch("ucode.cli.load_state", return_value=state):
+            result = runner.invoke(app, ["status"])
+
+        assert result.exit_code == 0, result.output
+        output = _strip_ansi(result.output)
+        assert "Model Provider Service: system.ai.anthropic" in output
+        assert "Databricks OSS shim" not in output
+
 
 class TestConfigureSkillsCommand:
     def test_mcp_flag_dispatches_location_set(self):
