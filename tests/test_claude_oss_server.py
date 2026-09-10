@@ -156,6 +156,36 @@ class _ShimServerCase(unittest.TestCase):
         with urllib.request.urlopen(request) as response:
             return response.status, json.loads(response.read().decode("utf-8"))
 
+    def _get(self, path: str) -> tuple[int, dict]:
+        request = urllib.request.Request(f"{self.base_url}{path}", method="GET")
+        with urllib.request.urlopen(request) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+
+
+class TestModelsEndpoint(_ShimServerCase):
+    """`GET /v1/models` is what Claude Code's native
+    CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY calls to populate the full model
+    picker beyond the 3 hardcoded Opus/Sonnet/Haiku tiers — same response shape
+    as Anthropic's real /v1/models, which `ucode.databricks.list_anthropic_model_catalog`
+    already parses elsewhere ({"data": [{"id": ..., "display_name": ...}]})."""
+
+    def test_lists_every_model_in_the_catalogue(self):
+        status, body = self._get("/v1/models")
+        assert status == 200
+        ids = [entry["id"] for entry in body["data"]]
+        assert ids == ["databricks-glm-5-2"]
+
+    def test_each_entry_has_the_anthropic_models_api_shape(self):
+        _, body = self._get("/v1/models")
+        entry = body["data"][0]
+        assert entry["type"] == "model"
+        assert entry["id"] == "databricks-glm-5-2"
+        assert isinstance(entry["display_name"], str) and entry["display_name"]
+
+    def test_has_more_is_false(self):
+        _, body = self._get("/v1/models")
+        assert body["has_more"] is False
+
 
 class TestMessagesEndpoint(_ShimServerCase):
     def test_non_streaming_message_translates_both_ways(self):

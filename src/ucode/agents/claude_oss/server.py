@@ -242,8 +242,27 @@ class Handler(BaseHTTPRequestHandler):
         return self._open_upstream(payload, stream=stream)
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path.rstrip("/") in ("/health", ""):
+        path = self.path.rstrip("/")
+        if path in ("/health", ""):
             self._send_json(200, {"status": "ok", "models": self.router.catalogue})
+            return
+        if path == "/v1/models":
+            # Claude Code's native CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY
+            # calls this to populate the full /model picker, rather than being
+            # limited to the 3 hardcoded ANTHROPIC_DEFAULT_*_MODEL tiers. Shape
+            # matches Anthropic's real /v1/models response, which
+            # ucode.databricks.list_anthropic_model_catalog already parses
+            # elsewhere ({"data": [{"id", "display_name", "type"}], "has_more"}).
+            self._send_json(
+                200,
+                {
+                    "data": [
+                        {"type": "model", "id": model_id, "display_name": model_id}
+                        for model_id in self.router.catalogue
+                    ],
+                    "has_more": False,
+                },
+            )
             return
         self._send_error(404, f"Unknown path: {self.path}")
 
