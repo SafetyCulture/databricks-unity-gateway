@@ -635,7 +635,19 @@ def configure_shared_state(
         # outright — see `claude.py`'s `_launch_oss_shim`/`launch()`. An explicit
         # `--no-oss-fallback` (no_oss_fallback) overrides that and forces the
         # normal "no models available" error instead.
-        if want_claude:
+        #
+        # Gated on `want_oss` as well as `want_claude`: `want_claude` also fires
+        # for copilot and pi (they build model lists from claude_models), but
+        # `want_oss` does not, so for those tools `oss_models` is an untouched
+        # empty list and recomputing here would reset a correct True to False
+        # from data that was never fetched. That normally self-corrects on the
+        # next real `ug claude`, whose discovery refreshes both lists — but
+        # `--skip-preflight` returns above without reaching this block, so the
+        # bad value would stick and `resolve_launch_model` would reject the
+        # launch with "No models available for claude" on a workspace where the
+        # shim works. Leaving the flag untouched keeps whatever the last call
+        # that actually looked at both lists concluded.
+        if want_claude and want_oss:
             state["claude_oss_fallback"] = (
                 not no_oss_fallback and not claude_models and bool(oss_models)
             )

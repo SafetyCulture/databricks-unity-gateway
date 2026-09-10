@@ -3194,12 +3194,16 @@ class TestConfigureSharedStateOssFallback:
     Claude models but some OSS chat models (GLM, Kimi, ...) should configure
     for the translation shim instead of leaving `claude_models` empty.
 
-    Exercised with no `tools` filter (fetch_all) so both `want_claude` and
-    `want_oss` are true in the same call — `configure_shared_state` only ever
-    persists `oss_models` when `want_oss` is true (see the `want_oss`
-    definition, which fires for "opencode"/"codex" but not a lone "claude"),
-    so a `tools=["claude"]`-only call (as every real `ucode claude` launch
-    makes) never exercises this wiring at all.
+    `want_oss` includes "claude", so a `tools=["claude"]`-only call — which is
+    what every real `ucode claude` launch makes — does discover OSS models and
+    compute the flag (pinned by
+    `test_a_lone_claude_configure_discovers_oss_models_too`). Several cases
+    below pass no `tools` filter at all (fetch_all) simply because the flag's
+    condition doesn't depend on which tool asked.
+
+    `want_oss` does NOT include "copilot"/"pi" even though `want_claude` does,
+    so those tools must leave the flag untouched rather than recompute it from
+    an `oss_models` they never fetched.
     """
 
     WS = "https://example.cloud.databricks.com"
@@ -3294,6 +3298,94 @@ class TestConfigureSharedStateOssFallback:
         )
 
         state = cli_mod.configure_shared_state(self.WS, tools=["claude"], no_oss_fallback=True)
+
+        assert state.get("claude_oss_fallback") is not True
+
+    def _stub_with_persistence(self, monkeypatch, claude_models, oss_models, persisted=None):
+        """As `_stub_external_deps`, but with an in-memory store standing in for
+        the state file (the module-level `no_state_writes` fixture Mocks out the
+        real `save_state`), so a sequence of calls sees each other's writes the
+        way consecutive `ug` commands do. Returns the store."""
+        import ucode.cli as cli_mod
+
+        store: dict = {} if persisted is None else persisted
+
+        def fake_save(state):
+            store.clear()
+            store.update(json.loads(json.dumps(state)))
+
+        self._stub_external_deps(monkeypatch)
+        monkeypatch.setattr(cli_mod, "load_state", lambda: json.loads(json.dumps(store)))
+        monkeypatch.setattr(cli_mod, "save_state", fake_save)
+        monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: (claude_models, None))
+        monkeypatch.setattr(cli_mod, "discover_oss_models", lambda w, t: (oss_models, None))
+        return store
+
+    def test_a_copilot_configure_then_skip_preflight_keeps_the_fallback(self, monkeypatch):
+        """`want_claude` fires for copilot/pi but `want_oss` does not, so the flag
+        was recomputed from an `oss_models` that was never fetched and reset to
+        False. That normally self-corrects on the next real `ug claude` (which
+        re-runs full discovery), but `--skip-preflight` returns from
+        `configure_shared_state` before the recomputation block — so the False
+        sticks, and `resolve_launch_model` rejects the launch with "No models
+        available for claude" on a workspace where the shim would have worked."""
+        import ucode.cli as cli_mod
+        from ucode.agents import resolve_launch_model
+
+        self._stub_with_persistence(monkeypatch, {}, ["databricks-glm-5-2"])
+
+        # 1. A real `ug claude`: no Claude models, some OSS models.
+        state = cli_mod.configure_shared_state(self.WS, tools=["claude"])
+        assert state["claude_oss_fallback"] is True
+
+        # 2. An intervening `ug copilot`, which never discovers OSS models.
+        state = cli_mod.configure_shared_state(self.WS, tools=["copilot"])
+        assert state.get("claude_oss_fallback") is True
+
+        # 3. `ug claude --skip-preflight`, which recomputes nothing at all.
+        state = cli_mod.configure_shared_state(self.WS, tools=["claude"], skip_preflight=True)
+        assert state.get("claude_oss_fallback") is True
+
+        # And the flag is what stops the launch being rejected outright.
+        resolve_launch_model("claude", state, None)
+
+    def test_a_pi_configure_also_leaves_the_fallback_alone(self, monkeypatch):
+        import ucode.cli as cli_mod
+
+        self._stub_with_persistence(monkeypatch, {}, ["databricks-glm-5-2"])
+        cli_mod.configure_shared_state(self.WS, tools=["claude"])
+
+        state = cli_mod.configure_shared_state(self.WS, tools=["pi"])
+
+        assert state.get("claude_oss_fallback") is True
+
+    def test_a_copilot_configure_does_not_invent_a_fallback(self, monkeypatch):
+        """Leaving the flag alone must not mean setting it: a workspace that
+        never had one must not acquire one from a tool that discovered nothing."""
+        import ucode.cli as cli_mod
+
+        self._stub_with_persistence(monkeypatch, {}, [])
+
+        state = cli_mod.configure_shared_state(self.WS, tools=["copilot"])
+
+        assert state.get("claude_oss_fallback") is not True
+
+    def test_a_real_claude_configure_still_clears_a_stale_fallback(self, monkeypatch):
+        """The other half of the rule: once the workspace does have Claude
+        models, a `ug claude` configure — which fetches both lists — must drop
+        the flag, or the shim would keep being preferred over real Claude."""
+        import ucode.cli as cli_mod
+
+        store = self._stub_with_persistence(monkeypatch, {}, ["databricks-glm-5-2"])
+        assert cli_mod.configure_shared_state(self.WS, tools=["claude"])["claude_oss_fallback"]
+
+        self._stub_with_persistence(
+            monkeypatch,
+            {"opus": "databricks-claude-opus-4-8"},
+            ["databricks-glm-5-2"],
+            persisted=store,
+        )
+        state = cli_mod.configure_shared_state(self.WS, tools=["claude"])
 
         assert state.get("claude_oss_fallback") is not True
 
