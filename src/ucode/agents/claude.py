@@ -1513,6 +1513,18 @@ def _launch_oss_shim(state: dict, binary: str, tool_args: list[str]) -> None:
             # no reason to hide the full GLM/Kimi/... catalogue behind a flag when
             # the shim is already running and translating every request anyway.
             "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+            # Live-reproduced (Claude Code's own debug log): "[gatewayDiscovery]
+            # skipped: no credential (ANTHROPIC_AUTH_TOKEN, apiKeyHelper, or API
+            # key)" - the discovery flag above is necessary but not sufficient.
+            # Claude Code also requires one of those three credential mechanisms
+            # to be present before it will call /v1/models at all, and this
+            # launch mode deliberately configures none of them for real (no
+            # apiKeyHelper is written, and a real ANTHROPIC_API_KEY is stripped
+            # above). A placeholder costs nothing: the shim never reads the
+            # incoming Authorization header - `_open_upstream` builds its own
+            # from the workspace token cache - so whatever Claude Code sends
+            # here is discarded either way.
+            "ANTHROPIC_AUTH_TOKEN": "ucode-oss-shim-placeholder",
         }
     )
 

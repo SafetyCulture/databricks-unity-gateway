@@ -1449,6 +1449,47 @@ class TestClaudeLaunch:
 
         assert started["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
 
+    def test_launch_oss_shim_sets_a_placeholder_auth_token_for_discovery(
+        self, monkeypatch, tmp_path
+    ):
+        """Live-reproduced: Claude Code's own debug log says
+        '[gatewayDiscovery] skipped: no credential (ANTHROPIC_AUTH_TOKEN,
+        apiKeyHelper, or API key)' - CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY
+        alone is not sufficient, Claude Code also requires ONE of those three
+        credential mechanisms to be present before it will call /v1/models at
+        all, and the OSS shim deliberately sets none of them (no apiKeyHelper,
+        real ANTHROPIC_API_KEY stripped). A placeholder ANTHROPIC_AUTH_TOKEN
+        satisfies that check with no security cost: the shim never reads the
+        incoming Authorization header (see _open_upstream, which builds its own
+        from the workspace token cache), so Claude Code can send anything."""
+        state = {
+            "workspace": "https://example.cloud.databricks.com",
+            "oss_models": ["databricks-glm-5-2", "databricks-kimi-k3"],
+        }
+        started = {}
+
+        class FakeProc:
+            returncode = 0
+
+            def wait(self):
+                return 0
+
+        def fake_popen(argv, **kwargs):
+            started["env"] = kwargs.get("env")
+            return FakeProc()
+
+        monkeypatch.setattr(claude.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *a, **k: "fake-token")
+        monkeypatch.setattr(
+            claude.gateway_proxy, "get_databricks_token", lambda *a, **k: "fake-token"
+        )
+        monkeypatch.setattr(claude, "write_tool_config", lambda *a, **k: {})
+
+        with pytest.raises(SystemExit):
+            claude._launch_oss_shim(state, "claude", [])
+
+        assert started["env"].get("ANTHROPIC_AUTH_TOKEN")
+
     def test_launch_oss_shim_omits_the_1m_suffix_for_a_smaller_context_model(
         self, monkeypatch, tmp_path
     ):
