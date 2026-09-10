@@ -187,6 +187,59 @@ class TestModelsEndpoint(_ShimServerCase):
         assert body["has_more"] is False
 
 
+class TestGetRequestTracing(unittest.TestCase):
+    """CLAUDE_OSS_SHIM_LOG must record GET requests too, not just the /v1/messages
+    POST traffic - otherwise there's no way to tell, from a live launch, whether
+    Claude Code ever actually called /v1/models to discover the catalogue versus
+    silently not asking at all. GET carries no secrets (no body, and the
+    Authorization header isn't Claude Code's real credential - the shim discards
+    it), so tracing it costs nothing security-wise."""
+
+    def setUp(self):
+        self._original_databricks_bearer = os.environ.pop("DATABRICKS_BEARER", None)
+        os.environ["DATABRICKS_BEARER"] = "stub-token"
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.log_path = Path(self._tmpdir.name) / "trace.jsonl"
+        self._original_log_env = os.environ.get("CLAUDE_OSS_SHIM_LOG")
+        os.environ["CLAUDE_OSS_SHIM_LOG"] = str(self.log_path)
+        self.tokens = TokenCache("http://127.0.0.1:1", None)
+        router = ModelRouter(["databricks-glm-5-2"], "databricks-glm-5-2")
+        self.server = make_server("http://127.0.0.1:1", self.tokens, router)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.tokens.stop()
+        self._tmpdir.cleanup()
+        if self._original_log_env is None:
+            os.environ.pop("CLAUDE_OSS_SHIM_LOG", None)
+        else:
+            os.environ["CLAUDE_OSS_SHIM_LOG"] = self._original_log_env
+        if self._original_databricks_bearer is None:
+            os.environ.pop("DATABRICKS_BEARER", None)
+        else:
+            os.environ["DATABRICKS_BEARER"] = self._original_databricks_bearer
+
+    def _get(self, path: str) -> tuple[int, dict]:
+        request = urllib.request.Request(f"{self.base_url}{path}", method="GET")
+        with urllib.request.urlopen(request) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+
+    def test_a_v1_models_request_is_traced(self):
+        self._get("/v1/models")
+        lines = [json.loads(line) for line in self.log_path.read_text().strip().splitlines()]
+        assert any(
+            line["kind"] == "get" and line["payload"]["path"] == "/v1/models" for line in lines
+        )
+
+    def test_a_health_check_is_traced(self):
+        self._get("/health")
+        lines = [json.loads(line) for line in self.log_path.read_text().strip().splitlines()]
+        assert any(line["kind"] == "get" and line["payload"]["path"] == "/health" for line in lines)
+
+
 class TestMessagesEndpoint(_ShimServerCase):
     def test_non_streaming_message_translates_both_ways(self):
         status, body = self._post(

@@ -243,6 +243,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.rstrip("/")
+        # Traced unconditionally (GET carries no request body and the shim
+        # discards whatever Authorization header Claude Code sends, so there's
+        # nothing secret here) - this is the only way to tell, from a live
+        # CLAUDE_OSS_SHIM_LOG trace, whether Claude Code ever actually asked for
+        # /v1/models rather than silently skipping discovery.
+        self.trace("get", {"path": self.path})
         if path in ("/health", ""):
             self._send_json(200, {"status": "ok", "models": self.router.catalogue})
             return
