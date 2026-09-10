@@ -76,7 +76,14 @@ class _Logger:
     """Append-only JSONL tracing, enabled by CLAUDE_OSS_SHIM_LOG.
 
     Off by default. Records translated request/response bodies only — never
-    the bearer token — which is what makes a translation bug diagnosable."""
+    the bearer token — which is what makes a translation bug diagnosable.
+
+    Those bodies are the full conversation (prompts, tool output, images), so
+    the file is created 0o600 rather than left to the process umask. The mode
+    only applies at creation: a file the user already made keeps whatever mode
+    they gave it."""
+
+    _CREATE_MODE = 0o600
 
     def __init__(self, path: str | None) -> None:
         self.path = path
@@ -91,7 +98,12 @@ class _Logger:
             return
         with self._lock:
             try:
-                with open(self.path, "a", encoding="utf-8") as handle:
+                descriptor = os.open(
+                    self.path,
+                    os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                    self._CREATE_MODE,
+                )
+                with open(descriptor, "a", encoding="utf-8") as handle:
                     handle.write(line + "\n")
             except OSError:
                 pass
