@@ -955,6 +955,61 @@ class TestWriteToolConfigManagedSettings:
 
         assert verified == [("claude", str(FAKE_MANAGED_PATH), "oss-shim-compatible")]
 
+    def test_oss_shim_fails_fast_on_a_genuine_managed_base_url_conflict(self, monkeypatch):
+        """Live-confirmed failure mode: a managed env.ANTHROPIC_BASE_URL pointing at the
+        real Anthropic gateway route (left over from ordinary, pre-OSS-fallback Claude
+        usage on this machine) outranks both the per-launch settings file and the shim's
+        loopback URL in the process env. Claude Code then sends OSS model ids straight to
+        the real gateway, which 400s: "API type 'anthropic/v1/messages' is not supported
+        by 'databricks-kimi-k3'". Skipping the managed write (as ucode does for this path)
+        must not also skip detecting this — fail at configure time instead, like relayed
+        already does for the equivalent risk."""
+        private_writes: list = []
+        managed_writes: list = []
+        existing = {
+            str(FAKE_MANAGED_PATH): {
+                "env": {
+                    "ANTHROPIC_BASE_URL": f"{WS}/ai-gateway/anthropic",
+                },
+                "apiKeyHelper": "/Users/joshw/.local/bin/ucode auth-token --host " + WS,
+            }
+        }
+        self._patch(monkeypatch, private_writes, managed_writes, existing)
+        state = {"workspace": WS, "codex_models": [], "claude_oss_fallback": True}
+
+        with pytest.raises(RuntimeError, match="run `ucode revert`"):
+            claude.write_tool_config(
+                state,
+                None,
+                provider_models={"opus": "databricks-glm-5-2[1m]"},
+                oss_shim_base_url="http://127.0.0.1:54321",
+            )
+
+        assert managed_writes == []
+
+    def test_oss_shim_ignores_a_stale_loopback_url_in_the_managed_file(self, monkeypatch):
+        """The counterpart to the fail-fast test above: a managed
+        env.ANTHROPIC_BASE_URL that is ALREADY a loopback URL is ucode's own harmless
+        leftover from an earlier relayed/OSS-shim session (the managed write has been
+        skipped for both modes since the fix that made this path reachable at all), not
+        a genuine external conflict — must not block the launch."""
+        private_writes: list = []
+        managed_writes: list = []
+        existing = {
+            str(FAKE_MANAGED_PATH): {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:11111"}}
+        }
+        self._patch(monkeypatch, private_writes, managed_writes, existing)
+        state = {"workspace": WS, "codex_models": [], "claude_oss_fallback": True}
+
+        claude.write_tool_config(
+            state,
+            None,
+            provider_models={"opus": "databricks-glm-5-2[1m]"},
+            oss_shim_base_url="http://127.0.0.1:54321",
+        )
+
+        assert managed_writes == []
+
     def test_oss_shim_stays_usable_noninteractively_after_an_interactive_launch(self, monkeypatch):
         """A prior interactive OSS launch could leave its (now dead) loopback port
         in the managed file. Non-interactively `managed_file_conflicts` would then

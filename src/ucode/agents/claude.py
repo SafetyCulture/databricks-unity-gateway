@@ -262,7 +262,19 @@ def revert_managed_settings() -> str:
 
 
 def _managed_relayed_conflicts(path: Path) -> list[str]:
-    """Return managed settings that would override Claude subscription relay auth."""
+    """Return managed settings that would override Claude subscription relay auth
+    or the OSS shim's loopback (both are loopback-server-backed launch modes with
+    the same class of managed-settings risk; shared by both callers below).
+
+    A managed `env.ANTHROPIC_BASE_URL` that already points at a loopback address
+    is not flagged: skipping the managed-file write for these modes (see
+    `_reconcile_managed_settings`) means the only way such a value gets there is
+    an earlier relayed/OSS-shim session's own (now-stale, harmless) URL, not an
+    externally significant one — the exact scenario the managed-write skip is
+    designed to leave behind without incident. `apiKeyHelper` and
+    `ANTHROPIC_CUSTOM_HEADERS` have no equivalent "obviously ours" shape, so any
+    non-empty value there is still treated as a conflict.
+    """
     text = read_managed_file(path)
     if text is None:
         return []
@@ -278,7 +290,8 @@ def _managed_relayed_conflicts(path: Path) -> list[str]:
         conflicts.append("apiKeyHelper")
     env = settings.get("env")
     if isinstance(env, dict):
-        if env.get("ANTHROPIC_BASE_URL"):
+        base_url = env.get("ANTHROPIC_BASE_URL")
+        if base_url and not base_url.startswith(f"http://{LOOPBACK_HOST}:"):
             conflicts.append("env.ANTHROPIC_BASE_URL")
         if env.get("ANTHROPIC_CUSTOM_HEADERS"):
             conflicts.append("env.ANTHROPIC_CUSTOM_HEADERS")
@@ -855,6 +868,16 @@ def _reconcile_managed_settings(
     scope pointing every subsequent bare `claude` at nothing. Skipping also keeps
     `_enforce_model_default_hierarchy` off this path, where `state["claude_models"]` is empty by
     definition and it would otherwise preserve stale Claude ids instead of the OSS tier pins.
+
+    Skipping the write does not mean the managed file can't still break this launch: a genuine
+    (non-loopback) `apiKeyHelper`/`env.ANTHROPIC_BASE_URL`/`env.ANTHROPIC_CUSTOM_HEADERS` already
+    sitting there — the highest-precedence scope — wins over both the per-launch settings file and
+    the shim's own loopback URL in the process environment. Confirmed live: with such an entry
+    present, Claude Code sent requests straight to the real Anthropic gateway route with an OSS
+    model id, which the gateway correctly 400s (`API type 'anthropic/v1/messages' is not supported
+    by '<model>'`) — a working shim with a broken session on top of it, discovered only mid-turn.
+    So, like relayed, the OSS-shim branch checks `_managed_relayed_conflicts` before skipping and
+    fails fast at configure time instead.
     """
     path = _managed_settings_path()
     if path is None:
@@ -869,6 +892,19 @@ def _reconcile_managed_settings(
             "with a regular file or contact your administrator."
         )
     if oss_shim and not relayed:
+        conflicts = _managed_relayed_conflicts(path)
+        if conflicts:
+            raise RuntimeError(
+                "Claude Code cannot reach the Databricks OSS-model shim because enterprise "
+                f"managed settings define {', '.join(conflicts)} at {path}. Those keys take "
+                "precedence over both the per-launch settings file and the shim's own loopback "
+                "URL in the process environment, so requests go straight to the real Anthropic "
+                "gateway route instead of being translated — Claude Code sends OSS model ids "
+                "there and the gateway rejects them (`API type 'anthropic/v1/messages' is not "
+                "supported by '<model>'`). Ask your administrator to remove those entries, or "
+                "if ucode previously created them, run `ucode revert` from an interactive "
+                "terminal first."
+            )
         mark_managed_file_verified(state, "claude", path, scope=OSS_SHIM_MANAGED_SCOPE)
         return
     if relayed:
