@@ -619,6 +619,11 @@ def configure_shared_state(
             state["codex_models"] = codex_models
         if want_oss:
             state["oss_models"] = oss_models
+        # No Claude models but some OSS models (GLM, Kimi, ...) means `ucode
+        # claude` should run against the translation shim instead of failing
+        # outright — see `claude.py`'s `_launch_oss_shim`/`launch()`.
+        if want_claude:
+            state["claude_oss_fallback"] = not claude_models and bool(oss_models)
         if fetch_all or "opencode" in tools:
             state["opencode_models"] = opencode_models
     save_state(state)

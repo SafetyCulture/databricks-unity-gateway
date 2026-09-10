@@ -3143,6 +3143,80 @@ class TestConfigureSharedStateMcpCleanup:
         assert purge_calls == []
 
 
+class TestConfigureSharedStateOssFallback:
+    """`claude_oss_fallback` is the one-line policy connecting Task 0's
+    `discover_oss_models` to Task 5's `_launch_oss_shim`: a workspace with no
+    Claude models but some OSS chat models (GLM, Kimi, ...) should configure
+    for the translation shim instead of leaving `claude_models` empty.
+
+    Exercised with no `tools` filter (fetch_all) so both `want_claude` and
+    `want_oss` are true in the same call — `configure_shared_state` only ever
+    persists `oss_models` when `want_oss` is true (see the `want_oss`
+    definition, which fires for "opencode"/"codex" but not a lone "claude"),
+    so a `tools=["claude"]`-only call (as every real `ucode claude` launch
+    makes) never exercises this wiring at all.
+    """
+
+    WS = "https://example.cloud.databricks.com"
+
+    @staticmethod
+    def _stub_external_deps(monkeypatch):
+        import ucode.cli as cli_mod
+
+        monkeypatch.setattr(cli_mod, "normalize_workspace_url", lambda w: w)
+        monkeypatch.setattr(cli_mod, "run_databricks_login", lambda w, p: None)
+        monkeypatch.setattr(cli_mod, "ensure_databricks_auth", lambda w, p=None: None)
+        monkeypatch.setattr(cli_mod, "find_profile_name_for_host", lambda w: None)
+        monkeypatch.setattr(cli_mod, "get_databricks_token", lambda w, p: "token")
+        monkeypatch.setattr(
+            cli_mod, "probe_unity_gateway_capabilities", lambda w, t: MODEL_SERVICE_PROBE
+        )
+        monkeypatch.setattr(cli_mod, "discover_model_services", lambda w, t: ({}, [], [], [], None))
+        monkeypatch.setattr(cli_mod, "discover_gemini_models", lambda w, t: ([], None))
+        monkeypatch.setattr(cli_mod, "discover_codex_models", lambda w, t: ([], None))
+        monkeypatch.setattr(cli_mod, "build_shared_base_urls", lambda w: {})
+        monkeypatch.setattr(cli_mod, "load_state", lambda: {})
+
+    def test_sets_oss_fallback_when_no_claude_models_but_oss_models_exist(self, monkeypatch):
+        import ucode.cli as cli_mod
+
+        self._stub_external_deps(monkeypatch)
+        monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: ({}, None))
+        monkeypatch.setattr(
+            cli_mod, "discover_oss_models", lambda w, t: (["databricks-glm-5-2"], None)
+        )
+
+        state = cli_mod.configure_shared_state(self.WS)
+
+        assert state["claude_oss_fallback"] is True
+
+    def test_does_not_set_oss_fallback_when_claude_models_exist(self, monkeypatch):
+        import ucode.cli as cli_mod
+
+        self._stub_external_deps(monkeypatch)
+        monkeypatch.setattr(
+            cli_mod, "discover_claude_models", lambda w, t: ({"opus": "claude-opus-4-8"}, None)
+        )
+        monkeypatch.setattr(
+            cli_mod, "discover_oss_models", lambda w, t: (["databricks-glm-5-2"], None)
+        )
+
+        state = cli_mod.configure_shared_state(self.WS)
+
+        assert state.get("claude_oss_fallback") is not True
+
+    def test_does_not_set_oss_fallback_when_no_oss_models_either(self, monkeypatch):
+        import ucode.cli as cli_mod
+
+        self._stub_external_deps(monkeypatch)
+        monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: ({}, None))
+        monkeypatch.setattr(cli_mod, "discover_oss_models", lambda w, t: ([], "no models"))
+
+        state = cli_mod.configure_shared_state(self.WS)
+
+        assert state.get("claude_oss_fallback") is not True
+
+
 class TestConfigureSharedStateSkipDiscovery:
     """With skip_model_discovery (provider mode), the heavy family discovery is
     skipped; only a single web-search model is fetched, and existing model lists
