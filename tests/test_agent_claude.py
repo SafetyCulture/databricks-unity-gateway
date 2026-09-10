@@ -868,6 +868,109 @@ class TestWriteToolConfigManagedSettings:
         assert managed_writes == []
         assert warns == []
 
+    def test_oss_shim_skips_managed_write_across_consecutive_launches(self, monkeypatch):
+        """The OSS shim's loopback server only runs inside `_launch_oss_shim` and
+        binds a fresh random port each launch, so mirroring its base URL into the
+        root-owned managed file would rewrite that file (a sudo prompt) on every
+        launch from the second onwards, and leave a dead loopback URL in the
+        highest-precedence scope for every bare `claude` afterwards. Same property
+        as relayed, so the same skip."""
+        private_writes: list = []
+        managed_writes: list = []
+        warns: list = []
+        self._patch(monkeypatch, private_writes, managed_writes)
+        monkeypatch.setattr(claude, "print_warning", lambda msg: warns.append(msg))
+        state = {"workspace": WS, "codex_models": [], "claude_oss_fallback": True}
+
+        for port in (54321, 61234):
+            claude.write_tool_config(
+                state,
+                None,
+                provider_models={"opus": "databricks-glm-5-2[1m]"},
+                oss_shim_base_url=f"http://127.0.0.1:{port}",
+            )
+
+        assert managed_writes == []
+        assert warns == []
+        # The per-launch settings file still tracks whichever port is live.
+        assert private_writes[-1][1]["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:61234"
+
+    def test_oss_shim_records_a_managed_scope_of_its_own(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        verified: list = []
+        self._patch(monkeypatch, private_writes, managed_writes)
+        monkeypatch.setattr(
+            claude,
+            "mark_managed_file_verified",
+            lambda state, tool, path, **kwargs: verified.append(
+                (tool, str(path), kwargs.get("scope"))
+            ),
+        )
+        state = {"workspace": WS, "codex_models": []}
+
+        claude.write_tool_config(
+            state,
+            None,
+            provider_models={"opus": "databricks-glm-5-2[1m]"},
+            oss_shim_base_url="http://127.0.0.1:54321",
+        )
+
+        assert verified == [("claude", str(FAKE_MANAGED_PATH), "oss-shim-compatible")]
+
+    def test_oss_shim_stays_usable_noninteractively_after_an_interactive_launch(self, monkeypatch):
+        """A prior interactive OSS launch could leave its (now dead) loopback port
+        in the managed file. Non-interactively `managed_file_conflicts` would then
+        compare that stale port against the live one and hard-fail every
+        `ug claude` forever. Skipping the mirror entirely removes the conflict."""
+        private_writes: list = []
+        managed_writes: list = []
+        existing = {
+            str(FAKE_MANAGED_PATH): {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:11111"}}
+        }
+        self._patch(monkeypatch, private_writes, managed_writes, existing)
+        monkeypatch.setattr(claude, "managed_writes_allowed", lambda: False)
+        state = {"workspace": WS, "codex_models": [], "claude_oss_fallback": True}
+
+        claude.write_tool_config(
+            state,
+            None,
+            provider_models={"opus": "databricks-glm-5-2[1m]"},
+            oss_shim_base_url="http://127.0.0.1:22222",
+        )
+
+        assert managed_writes == []
+
+    def test_oss_shim_leaves_stale_claude_model_pins_in_the_managed_file_untouched(
+        self, monkeypatch
+    ):
+        """`_enforce_model_default_hierarchy` derives `ucode_defaults` from
+        `state["claude_models"]`, which is empty in OSS-fallback mode, so it would
+        fall through to whatever Claude ids the managed file already holds — i.e.
+        write back stale Claude pins while the live per-launch settings file holds
+        the GLM/Kimi ones. Skipping the managed write makes that unreachable."""
+        private_writes: list = []
+        managed_writes: list = []
+        existing = {
+            str(FAKE_MANAGED_PATH): {
+                "env": {"ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8"}
+            }
+        }
+        self._patch(monkeypatch, private_writes, managed_writes, existing)
+        state = {"workspace": WS, "codex_models": [], "claude_models": {}}
+
+        claude.write_tool_config(
+            state,
+            None,
+            provider_models={"opus": "databricks-glm-5-2[1m]", "sonnet": "databricks-kimi-k3[1m]"},
+            oss_shim_base_url="http://127.0.0.1:54321",
+        )
+
+        assert managed_writes == []
+        private_env = private_writes[-1][1]["env"]
+        assert private_env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "databricks-glm-5-2[1m]"
+        assert private_env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-kimi-k3[1m]"
+
     def test_relayed_fails_on_conflicting_managed_auth(self, monkeypatch):
         private_writes: list = []
         managed_writes: list = []

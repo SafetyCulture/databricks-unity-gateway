@@ -188,6 +188,12 @@ MAXIMUM_MLFLOW_VERSION = (3, 12)
 # launches — normal launches keep loading user settings (hooks/permissions) as before.
 _RELAYED_SETTING_SOURCES = "project,local"
 
+# Managed-file fingerprint scopes recorded when the OS-managed mirror is deliberately NOT written.
+# Distinct values so `ucode status` can name which launch mode left it unmirrored (see
+# `managed_files.managed_file_status`) rather than claiming the file mirrors ucode's config.
+RELAY_MANAGED_SCOPE = "relay-compatible"
+OSS_SHIM_MANAGED_SCOPE = "oss-shim-compatible"
+
 
 def _managed_settings_path() -> Path | None:
     """OS-specific location of Claude Code's enterprise managed-settings.json.
@@ -220,7 +226,9 @@ def managed_settings_are_current(state: dict) -> bool:
     if path is None:
         return True
     if state.get("claude_relayed"):
-        required_scope = "relay-compatible"
+        required_scope = RELAY_MANAGED_SCOPE
+    elif state.get("claude_oss_fallback"):
+        required_scope = OSS_SHIM_MANAGED_SCOPE
     elif managed_writes_allowed():
         required_scope = "managed"
     else:
@@ -714,6 +722,7 @@ def write_tool_config(
         lambda base: _compose(base, enforce_model_default_hierarchy=True),
         managed_file_keys,
         relayed,
+        oss_shim=oss_shim_base_url is not None,
     )
 
     if web_search_model:
@@ -816,6 +825,7 @@ def _reconcile_managed_settings(
     compose: Callable[[dict], dict],
     owned_paths: list[list[str]],
     relayed: bool,
+    oss_shim: bool = False,
 ) -> None:
     """Reconcile Claude Code's OS-managed settings so a bare ``claude`` uses the gateway.
 
@@ -825,6 +835,16 @@ def _reconcile_managed_settings(
 
     Relayed launches are skipped: they depend on a per-session loopback refresh proxy that only runs
     during `ucode claude`, so a bare `claude` could not reach the gateway anyway.
+
+    OSS-shim launches (``oss_shim``, i.e. ``write_tool_config`` was given an
+    ``oss_shim_base_url``) are skipped for exactly the same reason: the translation shim's loopback
+    server is only started inside `_launch_oss_shim`, and on a fresh random port each launch (see
+    `make_server`'s ``port=0``). Mirroring it would rewrite the root-owned file on every launch
+    (a sudo prompt each time), hard-fail non-interactive launches once the recorded port went
+    stale (`managed_file_conflicts`), and leave a dead loopback URL in the highest-precedence
+    scope pointing every subsequent bare `claude` at nothing. Skipping also keeps
+    `_enforce_model_default_hierarchy` off this path, where `state["claude_models"]` is empty by
+    definition and it would otherwise preserve stale Claude ids instead of the OSS tier pins.
     """
     path = _managed_settings_path()
     if path is None:
@@ -838,6 +858,9 @@ def _reconcile_managed_settings(
             f"Refusing to use Claude Code managed settings through symlink {path}. Replace it "
             "with a regular file or contact your administrator."
         )
+    if oss_shim and not relayed:
+        mark_managed_file_verified(state, "claude", path, scope=OSS_SHIM_MANAGED_SCOPE)
+        return
     if relayed:
         conflicts = _managed_relayed_conflicts(path)
         if conflicts:
@@ -847,7 +870,7 @@ def _reconcile_managed_settings(
                 "those entries or use standard Databricks authentication. If ucode previously "
                 "created them, run `ucode revert` from an interactive terminal first."
             )
-        mark_managed_file_verified(state, "claude", path, scope="relay-compatible")
+        mark_managed_file_verified(state, "claude", path, scope=RELAY_MANAGED_SCOPE)
         return
 
     current_text = read_managed_file(path)
