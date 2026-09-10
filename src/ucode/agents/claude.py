@@ -742,10 +742,22 @@ def write_tool_config(
         lambda base: _compose(base, enforce_model_default_hierarchy=True),
         managed_file_keys,
         relayed,
-        # Truthiness, not `is not None`, so this agrees with the two places that
-        # decide the actual behaviour: render_overlay's `elif oss_shim_base_url`
-        # and _compose's apiKeyHelper pop.
-        oss_shim=bool(oss_shim_base_url),
+        # NOT just `bool(oss_shim_base_url)`: the pre-launch call from
+        # `configure_tool` runs before the shim's port exists, so
+        # `oss_shim_base_url` is None there even though this write is still part
+        # of an OSS-fallback session. render_overlay/`_compose`'s apiKeyHelper pop
+        # both key on the literal `oss_shim_base_url` value instead — which is
+        # fine there, since that first write's private-file content is fully
+        # overwritten moments later by `_launch_oss_shim`'s own call. The managed
+        # file gets no such second chance (this call is the ONLY one that ever
+        # touches it while in OSS-fallback mode, precisely because it's the one
+        # NOT gated on `oss_shim_base_url` alone) — so it has to get this right
+        # on the very first write, or a stale conflict written here survives
+        # every subsequent `ucode revert` + `ug claude` cycle indefinitely
+        # (live-reproduced: revert clears the file, the next launch's pre-launch
+        # write recreates the identical conflict before ever reaching
+        # `_launch_oss_shim`, which only skips — never repairs — this file).
+        oss_shim=bool(oss_shim_base_url) or bool(state.get("claude_oss_fallback")),
     )
 
     if web_search_model:

@@ -955,6 +955,28 @@ class TestWriteToolConfigManagedSettings:
 
         assert verified == [("claude", str(FAKE_MANAGED_PATH), "oss-shim-compatible")]
 
+    def test_pre_launch_configure_also_skips_the_managed_write_in_oss_fallback(self, monkeypatch):
+        """Live-reproduced: `configure_tool`'s claude branch calls write_tool_config
+        BEFORE the shim's port exists (oss_shim_base_url=None), so `bool(oss_shim_base_url)`
+        alone can't tell this write apart from an ordinary direct-gateway configure. Without
+        also checking `claude_oss_fallback`, this first call took the regular write path and
+        wrote a real apiKeyHelper + real gateway ANTHROPIC_BASE_URL into the managed file -
+        which `_launch_oss_shim`'s own later call (which DOES pass oss_shim_base_url) never
+        gets a chance to undo, since it correctly skips the managed file entirely. Net effect
+        on a real machine: `ucode revert` clears the managed file, and the very next
+        `ug claude` silently rewrites the exact same conflict before ever reaching
+        `_launch_oss_shim` - permanently un-fixable by revert alone."""
+        private_writes: list = []
+        managed_writes: list = []
+        self._patch(monkeypatch, private_writes, managed_writes)
+        state = {"workspace": WS, "codex_models": [], "claude_oss_fallback": True}
+
+        # The pre-launch call: no oss_shim_base_url yet, matching configure_tool's
+        # actual claude branch (agents/__init__.py) exactly.
+        claude.write_tool_config(state, None)
+
+        assert managed_writes == []
+
     def test_oss_shim_fails_fast_on_a_genuine_managed_base_url_conflict(self, monkeypatch):
         """Live-confirmed failure mode: a managed env.ANTHROPIC_BASE_URL pointing at the
         real Anthropic gateway route (left over from ordinary, pre-OSS-fallback Claude
