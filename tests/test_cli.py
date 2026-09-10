@@ -3216,6 +3216,24 @@ class TestConfigureSharedStateOssFallback:
 
         assert state.get("claude_oss_fallback") is not True
 
+    def test_a_lone_claude_configure_discovers_oss_models_too(self, monkeypatch):
+        """Every real `ucode claude` invocation configures with `tools=["claude"]`
+        only (see `_auto_configure_tool`/`_launch_tool`) — `want_oss` must fire for
+        that case too, or `oss_models`/`claude_oss_fallback` could never be
+        populated via the actual command a user runs."""
+        import ucode.cli as cli_mod
+
+        self._stub_external_deps(monkeypatch)
+        monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: ({}, None))
+        monkeypatch.setattr(
+            cli_mod, "discover_oss_models", lambda w, t: (["databricks-glm-5-2"], None)
+        )
+
+        state = cli_mod.configure_shared_state(self.WS, tools=["claude"])
+
+        assert state["oss_models"] == ["databricks-glm-5-2"]
+        assert state["claude_oss_fallback"] is True
+
 
 class TestConfigureSharedStateSkipDiscovery:
     """With skip_model_discovery (provider mode), the heavy family discovery is
@@ -3374,6 +3392,76 @@ class TestSkipPreflightFlag:
             result = runner.invoke(app, [tool])
         assert result.exit_code == 0, result.output
         assert cfg.call_args.kwargs["skip_preflight"] is False
+
+
+class TestClaudeOssFallbackLaunchGating:
+    """`claude_oss_fallback=True` means no Claude models but some OSS models —
+    `ucode claude` must launch against the OSS shim instead of being rejected
+    by one of the "does claude have a model" gates that only ever looked at
+    `claude_models`: `resolve_launch_model` and `configure_tool`'s claude
+    branch (both hit on every `ucode claude` relaunch, via `_launch_tool`),
+    and `check_gateway_endpoint`/`skip_validation` (hit on first-run/explicit
+    configure, via `_auto_configure_tool`/`configure_single_tool`). These
+    exercise the real (unmocked) gates end to end, standing in for Task 5's
+    already-covered `_launch_oss_shim` internals with a stub."""
+
+    @staticmethod
+    def _state():
+        return {
+            **MINIMAL_STATE,
+            "claude_models": {},
+            "oss_models": ["databricks-glm-5-2", "databricks-kimi-k3"],
+            "claude_oss_fallback": True,
+            "available_tools": ["claude"],
+        }
+
+    def test_relaunch_reaches_the_oss_shim_dispatch_without_being_rejected(self, monkeypatch):
+        """`_launch_tool` (the path every `ucode claude` relaunch takes): real
+        `resolve_launch_model` and real `configure_tool` must not raise before
+        `claude.launch()` dispatches to `_launch_oss_shim`."""
+        import ucode.agents.claude as claude_mod
+
+        state = self._state()
+        oss_shim_calls: list = []
+        # write_tool_config is Task 4/5's real config writer (real file I/O) —
+        # stubbed here as identity so `configure_tool`'s claude-branch guard
+        # (the gate under test) still runs for real, without touching disk.
+        monkeypatch.setattr(claude_mod, "write_tool_config", lambda s, *a, **k: s)
+        monkeypatch.setattr(
+            claude_mod,
+            "_launch_oss_shim",
+            lambda s, binary, tool_args: oss_shim_calls.append(s),
+        )
+
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli._auto_configure_tool") as mock_auto,
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.ensure_provider_state", return_value=state),
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
+        ):
+            result = runner.invoke(app, ["claude"])
+
+        assert result.exit_code == 0, result.output
+        mock_auto.assert_not_called()
+        assert len(oss_shim_calls) == 1
+
+    def test_first_run_configure_gates_treat_oss_fallback_as_usable(self):
+        """`_auto_configure_tool` (the cold-start path, e.g. a bare `ucode claude`
+        with no prior configure): real `check_gateway_endpoint` must consider
+        claude "available" (used by `configure_single_tool`, which
+        `_auto_configure_tool` and the explicit `ucode configure` flow both
+        call), and real `skip_validation` must skip the live probe (there is
+        nothing listening — the shim only starts at launch, so `validate_tool`
+        would otherwise hang or fail against the real Databricks gateway)."""
+        import ucode.agents as agents_mod
+        from ucode.agents import claude as claude_mod
+
+        state = self._state()
+
+        assert agents_mod.check_gateway_endpoint(state, "claude") is True
+        assert claude_mod.skip_validation(state) is True
 
 
 class TestRejectDisabledAgent:

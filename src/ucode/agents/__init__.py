@@ -322,7 +322,14 @@ def resolve_launch_model(
 ) -> tuple[dict, str | None]:
     model = explicit_model or default_model_for_tool(tool, state)
     # if model is not specified for codex, then launch with harness's default model.
-    if not model and tool != "codex":
+    # claude_oss_fallback launches against the OSS translation shim instead of a
+    # Databricks Claude model — that path resolves its own model from
+    # state["oss_models"] inside _launch_oss_shim, so no model here isn't a failure.
+    if (
+        not model
+        and tool != "codex"
+        and not (tool == "claude" and state.get("claude_oss_fallback"))
+    ):
         raise RuntimeError(
             f"No models available for {tool}. Run `ucode configure` to set up your workspace."
         )
@@ -433,7 +440,10 @@ def configure_tool(
     elif tool == "claude":
         # A Model Provider Service routes by header and pins no Databricks
         # model, so the usual "model required" guard doesn't apply to claude.
-        if not model and not provider:
+        # Nor does claude_oss_fallback: _launch_oss_shim resolves and writes
+        # its own model pins from state["oss_models"] at launch time, so this
+        # configure step doesn't need one either.
+        if not model and not provider and not state.get("claude_oss_fallback"):
             raise RuntimeError(f"A {tool} model must be selected before configuration.")
         result = claude.write_tool_config(
             state,
@@ -477,7 +487,9 @@ def launch(
 def check_gateway_endpoint(state: dict, tool: str) -> bool:
     """V2-only: a tool is available iff we discovered models for it."""
     if tool == "claude":
-        return bool(state.get("claude_models"))
+        # claude_oss_fallback means claude has no Claude-family models but will
+        # launch against the OSS translation shim instead (see claude.launch).
+        return bool(state.get("claude_models")) or bool(state.get("claude_oss_fallback"))
     if tool == "opencode":
         return bool(state.get("opencode_models"))
     if tool == "codex":
