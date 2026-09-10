@@ -5,14 +5,42 @@ from __future__ import annotations
 import json
 import os
 import socket
+import tempfile
 import threading
 import unittest
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
-from ucode.agents.claude_oss.server import MAX_BODY_BYTES, ModelRouter, make_server
+from ucode.agents.claude_oss.server import MAX_BODY_BYTES, ModelRouter, _Logger, make_server
 from ucode.gateway_proxy import TokenCache
+
+
+class TestTraceLogger(unittest.TestCase):
+    def test_the_trace_file_is_created_owner_only(self):
+        """The trace records translated request/response bodies, i.e. the whole
+        conversation — prompts, tool output, images. It must not be created at
+        whatever the umask allows."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.jsonl"
+            _Logger(str(path))("request", {"model": "databricks-glm-5-2"})
+
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(path.read_text())["kind"], "request")
+
+    def test_appends_rather_than_truncating(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.jsonl"
+            logger = _Logger(str(path))
+            logger("request", {"n": 1})
+            logger("response", {"n": 2})
+
+            self.assertEqual(len(path.read_text().strip().splitlines()), 2)
+
+    def test_disabled_when_no_path_is_configured(self):
+        # No CLAUDE_OSS_SHIM_LOG means no file anywhere.
+        _Logger(None)("request", {"secret": "prompt"})
 
 
 class TestModelRouter(unittest.TestCase):
