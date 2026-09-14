@@ -361,6 +361,7 @@ class TestLaunchCustomOAuth:
             WS,
             profile=None,
             tools=["codex"],
+            no_oss_fallback=False,
             custom_oauth=custom_oauth,
         )
 
@@ -373,4 +374,6 @@ class TestLaunchCustomOAuth:
         ):
             cli_mod._auto_configure_tool("claude")
 
-        configure_shared.assert_called_once_with(WS, profile=None, tools=["claude"])
+        configure_shared.assert_called_once_with(
+            WS, profile=None, tools=["claude"], no_oss_fallback=False
+        )
