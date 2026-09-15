@@ -28,7 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from ucode.constants import LOOPBACK_HOST
-from ucode.databricks import model_token_limits, newest, supports_vision
+from ucode.databricks import model_token_limits, newest, oss_model_name, supports_vision
 from ucode.gateway_proxy import log_token_refresh_failure
 
 from . import translate
@@ -318,10 +318,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error(400, f"Could not translate the request: {type(exc).__name__}: {exc}")
             return
         self.trace("request", {"model_requested": body.get("model"), "upstream": payload})
+        # The response's `model` field must carry the same `[1m]` suffix Claude
+        # Code sent, not the bare catalogue id `payload` was built with: Claude
+        # Code tracks its context-window assumption off the model string it
+        # receives back in each response, not just the one it launched with.
+        # Echoing the bare id silently re-classifies an already-1M-pinned model
+        # as "unrecognized" (200k default) on every turn — see
+        # `ucode.databricks.oss_model_name`'s docstring for the live symptom
+        # this caused (status bar stuck near/at 100%, no compaction).
+        display_model = oss_model_name(model)
         if body.get("stream"):
-            self._stream(payload, model)
+            self._stream(payload, display_model)
         else:
-            self._once(payload, model)
+            self._once(payload, display_model)
 
     def _once(self, payload: dict, model: str) -> None:
         try:

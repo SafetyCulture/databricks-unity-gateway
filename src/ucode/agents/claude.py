@@ -37,8 +37,8 @@ from ucode.databricks import (
     build_auth_shell_command,
     build_tool_base_url,
     get_databricks_token,
-    model_token_limits,
     newest,
+    oss_model_name,
     ug_binary,
 )
 from ucode.launcher import exec_or_spawn
@@ -1553,26 +1553,10 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     raise SystemExit(returncode)
 
 
-# A context window at or above this earns Claude Code's `[1m]` name suffix.
-_LONG_CONTEXT_TOKENS = 1_000_000
-
-
-def _oss_model_name(model: str) -> str:
-    """The name to pin for an OSS model, with `[1m]` when it really is 1M-context.
-
-    `_maybe_add_1m_suffix` cannot be reused here: it matches `_CLAUDE_MODEL_RE`
-    (`claude-(opus|sonnet)-<version>`), so every OSS id falls through unsuffixed
-    and Claude Code keeps assuming its 200k default — auto-compacting five times
-    earlier than needed on GLM and Kimi K3, which are both 1M. Drive the decision
-    off the context window `ucode.databricks.model_token_limits` already records
-    per family rather than a second hand-maintained id list; an id with no known
-    limits makes no claim and stays bare."""
-    if model.endswith("[1m]"):
-        return model
-    limits = model_token_limits(model)
-    if limits and limits["context"] >= _LONG_CONTEXT_TOKENS:
-        return f"{model}[1m]"
-    return model
+# Re-exported: also used by claude_oss/server.py to echo the same suffixed
+# name back in each response's `model` field, not just at launch — see
+# `ucode.databricks.oss_model_name`'s docstring for why both call sites matter.
+_oss_model_name = oss_model_name
 
 
 def _assign_oss_model_tiers(oss_models: list[str]) -> tuple[str, str, str]:

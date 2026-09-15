@@ -287,6 +287,31 @@ class TestMessagesEndpoint(_ShimServerCase):
         self.assertIn("input_tokens", body)
         self.assertGreater(body["input_tokens"], 0)
 
+    def test_response_model_keeps_the_1m_suffix_claude_code_sent(self):
+        """Live-reproduced (real ug claude session, real workspace): Claude Code
+        sends "databricks-glm-5-2[1m]" as the request's model (from
+        ANTHROPIC_DEFAULT_OPUS_MODEL), but `ModelRouter.resolve` strips the
+        suffix to look the id up in the catalogue - and until this fix, the
+        BARE resolved id was echoed straight back in the response's own
+        "model" field too. Claude Code tracks its context-window assumption
+        off the model field it actually receives back, not the launch-time env
+        var, so every real response silently re-classified this 1M-context
+        model as an "unrecognized" one defaulting to a 200k window. Real
+        session evidence: 553k real input_tokens against an assumed 200k
+        ceiling shows as a stuck, clamped 100% in the status bar, while actual
+        compaction never fires (unrecognized-model window enforcement is
+        passive, not proactive) - "not resetting" and "not compacting" are the
+        same root cause."""
+        _, body = self._post(
+            "/v1/messages",
+            {
+                "model": "databricks-glm-5-2[1m]",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+        assert body["model"] == "databricks-glm-5-2[1m]"
+
     def test_unknown_path_is_404(self):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             self._post("/not-a-real-path", {})

@@ -1613,6 +1613,40 @@ def supports_vision(model_id: str) -> bool:
     return any(family in model_id for family in VISION_FAMILIES)
 
 
+# A context window at or above this earns Claude Code's `[1m]` name suffix.
+_LONG_CONTEXT_TOKENS = 1_000_000
+
+
+def oss_model_name(model: str) -> str:
+    """The name to pin/echo for an OSS model, with `[1m]` when it really is
+    1M-context.
+
+    Used both at launch (`ucode.agents.claude._launch_oss_shim`, to pin
+    ANTHROPIC_DEFAULT_*_MODEL) and per-response (`ucode.agents.claude_oss.
+    server.Handler._messages`, to echo the same suffixed name back in the
+    Anthropic-shaped response's `model` field). Both call sites matter: Claude
+    Code tracks its context-window assumption off the model string it actually
+    receives back in a response, not just the one it was launched with, so a
+    response echoing the bare id silently re-classifies an already-pinned 1M
+    model as "unrecognized" (200k default) on every single turn - the status
+    bar then shows real usage against the wrong ceiling (stuck near/at 100%
+    for a session nowhere near its real limit) while compaction never fires
+    (unrecognized-model window enforcement is passive, not proactive).
+
+    `_maybe_add_1m_suffix` (agents/claude.py) cannot be reused here: it
+    matches `_CLAUDE_MODEL_RE` (`claude-(opus|sonnet)-<version>`), so every
+    OSS id falls through unsuffixed. Drive the decision off the context
+    window `model_token_limits` already records per family rather than a
+    second hand-maintained id list; an id with no known limits makes no claim
+    and stays bare."""
+    if model.endswith("[1m]"):
+        return model
+    limits = model_token_limits(model)
+    if limits and limits["context"] >= _LONG_CONTEXT_TOKENS:
+        return f"{model}[1m]"
+    return model
+
+
 def newest(models: list[str], family: str) -> str | None:
     """Pick the highest-versioned model in `family` from a discovered model list.
 

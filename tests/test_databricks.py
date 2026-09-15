@@ -465,6 +465,25 @@ class TestSupportsVision:
         assert db_mod.supports_vision("databricks-glm-5-2") is False
 
 
+class TestOssModelName:
+    """Shared by both `ucode.agents.claude._launch_oss_shim` (pins
+    ANTHROPIC_DEFAULT_*_MODEL) and `ucode.agents.claude_oss.server`'s
+    `_messages` (echoes the same name back in every response's `model`
+    field) — both call sites matter, or Claude Code's context-window
+    tracking silently reverts to its 200k "unrecognized model" default on
+    every turn even though the launch-time pin said 1M."""
+
+    def test_a_1m_context_oss_model_gets_the_suffix(self):
+        assert db_mod.oss_model_name("databricks-glm-5-2") == "databricks-glm-5-2[1m]"
+        assert db_mod.oss_model_name("databricks-kimi-k3") == "databricks-kimi-k3[1m]"
+
+    def test_a_smaller_context_oss_model_does_not(self):
+        assert db_mod.oss_model_name("databricks-kimi-k2-7-code") == "databricks-kimi-k2-7-code"
+
+    def test_an_already_suffixed_id_is_not_doubled(self):
+        assert db_mod.oss_model_name("databricks-glm-5-2[1m]") == "databricks-glm-5-2[1m]"
+
+
 class TestDiscoverModelServices:
     def test_buckets_families_by_name(self, monkeypatch):
         payload = {
