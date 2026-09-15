@@ -359,6 +359,42 @@ class TestResponseTranslation(unittest.TestCase):
         )
         self.assertEqual(out["stop_reason"], "max_tokens")
         self.assertEqual(out["usage"]["cache_read_input_tokens"], 60)
+        # OpenAI's `prompt_tokens` (100) already INCLUDES the cached subset (60)
+        # - `cached_tokens` is a subset, not additive, unlike Anthropic's own
+        # `input_tokens`/`cache_read_input_tokens`, which are additive (Claude
+        # Code computes total context usage as input_tokens +
+        # cache_read_input_tokens + cache_creation_input_tokens). So the
+        # non-cached remainder (100 - 60 = 40) belongs in `input_tokens`, not
+        # the raw prompt_tokens total - otherwise the cached portion is
+        # counted twice and Claude Code's context meter runs roughly 2x real.
+        self.assertEqual(out["usage"]["input_tokens"], 40)
+
+    def test_a_near_fully_cached_turn_matches_the_real_prompt_size(self):
+        """Live-reproduced: a real session's recorded usage showed
+        input_tokens=674840, cache_read_input_tokens=674304 - nearly equal,
+        meaning almost the entire prompt was served from cache and only ~536
+        tokens were genuinely new. Before this fix, the shim reported the raw
+        prompt_tokens total (674840) as `input_tokens` AND the same near-total
+        again as `cache_read_input_tokens`, so Claude Code's
+        input+cache_read+cache_creation sum came to ~1.35M against this
+        model's real 1M window - a context meter stuck over 100% no matter
+        how the conversation actually grew."""
+        out = translate.openai_to_anthropic(
+            {
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": 674840,
+                    "completion_tokens": 5,
+                    "prompt_tokens_details": {"cached_tokens": 674304},
+                },
+            },
+            model="m",
+        )
+        usage = out["usage"]
+        self.assertEqual(usage["cache_read_input_tokens"], 674304)
+        self.assertEqual(usage["input_tokens"], 536)
+        total = usage["input_tokens"] + usage["cache_read_input_tokens"]
+        self.assertEqual(total, 674840)
 
     def test_empty_response_still_yields_a_content_block(self):
         out = translate.openai_to_anthropic({"choices": [{"message": {}}]}, model="m")

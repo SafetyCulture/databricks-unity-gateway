@@ -403,14 +403,36 @@ def _parse_arguments(raw: Any) -> dict:
 
 
 def _usage(raw: Any) -> dict:
+    """Translate OpenAI's usage shape into Anthropic's.
+
+    The two APIs disagree on what `input_tokens`/`prompt_tokens` even means.
+    Anthropic's `input_tokens` is only the tokens AFTER the last cache
+    breakpoint - `cache_read_input_tokens` and `cache_creation_input_tokens`
+    are ADDITIONAL to it (Anthropic's own docs: "total_input_tokens =
+    cache_read_input_tokens + cache_creation_input_tokens + input_tokens").
+    OpenAI's `prompt_tokens` is the OPPOSITE: the full prompt total, of which
+    `prompt_tokens_details.cached_tokens` is a SUBSET, not additional.
+
+    Live-reproduced: mapping `prompt_tokens` straight into `input_tokens`
+    while also reporting the cached subset as `cache_read_input_tokens`
+    double-counts the cached portion once Claude Code sums them per
+    Anthropic's formula - a real session's context meter ran ~2x actual
+    (674,840 + 674,304 summed against a 1M window, when the real total was
+    674,840). Subtracting the cached subset out of `input_tokens` first
+    keeps `input_tokens + cache_read_input_tokens == prompt_tokens`, matching
+    what OpenAI actually reported."""
     usage = raw if isinstance(raw, dict) else {}
+    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+    details = usage.get("prompt_tokens_details")
+    cached_tokens = 0
+    if isinstance(details, dict) and details.get("cached_tokens"):
+        cached_tokens = int(details["cached_tokens"])
     out = {
-        "input_tokens": int(usage.get("prompt_tokens") or 0),
+        "input_tokens": max(0, prompt_tokens - cached_tokens),
         "output_tokens": int(usage.get("completion_tokens") or 0),
     }
-    details = usage.get("prompt_tokens_details")
-    if isinstance(details, dict) and details.get("cached_tokens"):
-        out["cache_read_input_tokens"] = int(details["cached_tokens"])
+    if cached_tokens:
+        out["cache_read_input_tokens"] = cached_tokens
     return out
 
 
