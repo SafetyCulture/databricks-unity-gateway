@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import socket
@@ -13,7 +14,13 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-from ucode.agents.claude_oss.server import MAX_BODY_BYTES, ModelRouter, _Logger, make_server
+from ucode.agents.claude_oss.server import (
+    MAX_BODY_BYTES,
+    Handler,
+    ModelRouter,
+    _Logger,
+    make_server,
+)
 from ucode.gateway_proxy import TokenCache
 
 
@@ -566,3 +573,63 @@ class TestUpstreamAuthRetry(_ShimServerCase):
 
         self.assertEqual(ctx.exception.code, 401)
         self.assertEqual(len(_StubGateway.seen_authorizations), 2)
+
+
+class _BrokenPipeWriter(io.RawIOBase):
+    """A wfile stand-in that raises BrokenPipeError on write, mimicking a client
+    (Claude Code) that closed the connection mid-response. Mirrors
+    test_gateway_proxy.py's identical helper for the relayed proxy's own
+    version of this same failure class."""
+
+    def write(self, _data):  # type: ignore[override]
+        raise BrokenPipeError(32, "Broken pipe")
+
+
+def _bare_handler(wfile) -> Handler:
+    # Bypass BaseHTTPRequestHandler.__init__ (which would service a real
+    # socket); we only exercise _send_json's write path. Set the few
+    # attributes the send_response/send_header machinery reads (normally
+    # populated by __init__) — same technique as
+    # test_gateway_proxy.py's `_relay_handler`.
+    handler = object.__new__(Handler)
+    handler.wfile = wfile
+    handler.request_version = "HTTP/1.1"
+    handler.requestline = "POST /v1/messages HTTP/1.1"
+    handler.command = "POST"
+    handler._headers_buffer = []
+    handler.close_connection = False
+    handler.trace = lambda *a, **k: None
+    return handler
+
+
+class TestSendJsonClientDisconnect(unittest.TestCase):
+    """Live-reproduced: a real `ug claude` session dumped a raw
+    BrokenPipeError traceback into the user's terminal —
+    `do_POST -> _messages -> _once -> _send_json -> end_headers ->
+    flush_headers -> sendall`. Claude Code had already hung up (Ctrl-C
+    mid-turn, a cancelled/retried request) before the shim could write its
+    response. Every OTHER write path in this codebase (gateway_proxy.py's
+    `_relay_response`, this same module's `_send_error` and `_stream`'s
+    `_write_event`) already swallows this; `_send_json`'s success-path
+    callers (`_once`, `/health`, `/v1/models`, `/v1/messages/count_tokens`)
+    were the one gap."""
+
+    def test_swallows_broken_pipe_on_headers(self):
+        handler = _bare_handler(_BrokenPipeWriter())
+        # Must not raise — a dead client is a routine teardown, not an error
+        # that belongs in the user's terminal.
+        handler._send_json(200, {"ok": True})
+
+    def test_swallows_connection_reset_on_the_body_write(self):
+        class _ResetOnBody(io.RawIOBase):
+            def __init__(self):
+                self.wrote_headers = False
+
+            def write(self, data):  # type: ignore[override]
+                if not self.wrote_headers:
+                    self.wrote_headers = True
+                    return len(data)
+                raise ConnectionResetError(54, "Connection reset by peer")
+
+        handler = _bare_handler(_ResetOnBody())
+        handler._send_json(200, {"ok": True})

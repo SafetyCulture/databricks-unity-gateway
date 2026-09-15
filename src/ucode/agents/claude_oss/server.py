@@ -131,15 +131,32 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_json(self, status: int, payload: dict, *, close: bool = False) -> None:
         body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        if close:
-            # BaseHTTPRequestHandler.send_header also flips close_connection for
-            # this one, so the socket is torn down after the response is flushed.
-            self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            if close:
+                # BaseHTTPRequestHandler.send_header also flips close_connection
+                # for this one, so the socket is torn down after the response
+                # is flushed.
+                self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # The client (Claude Code) already hung up - Ctrl-C mid-turn, a
+            # cancelled/retried request, process exit - before we could write
+            # anything or partway through. Live-reproduced: an uncaught
+            # BrokenPipeError here (end_headers -> flush_headers -> sendall)
+            # propagates out of every success-path caller (_once, /health,
+            # /v1/models, count_tokens), and socketserver's default
+            # handle_error prints a raw traceback straight into the user's
+            # Claude Code terminal. A dead client is routine teardown, not an
+            # error - same treatment `_send_error` and `_stream`'s
+            # `_write_event` already give this, and `gateway_proxy.
+            # _ProxyHandler._relay_response` gives the relayed path's
+            # equivalent case.
+            self.trace("client_disconnect", {"status": status})
+            self.close_connection = True
 
     def _send_error(self, status: int, message: str) -> None:
         """Report an error and close the connection.
