@@ -4467,3 +4467,38 @@ class TestStdioProtocolLaunch:
             assert sys.stdout is sys.stderr
         finally:
             sys.stdout = real_stdout
+
+
+class TestRunClaudeOssProbe:
+    def _fail_if_called(self, *_a, **_k):
+        raise AssertionError("must not reach auth/discovery for a rejected workspace")
+
+    def test_rejects_an_explicit_non_https_workspace_before_any_auth(self, monkeypatch, capsys):
+        # normalize_workspace_url preserves an explicit http:// (loopback
+        # dev/test workspaces rely on this), so a real host given as
+        # http://... would otherwise reach ensure_databricks_auth and mint
+        # and send a real bearer token over plaintext.
+        monkeypatch.setattr(cli_mod, "load_state", lambda: {})
+        monkeypatch.setattr(cli_mod, "ensure_databricks_auth", self._fail_if_called)
+        monkeypatch.setattr(cli_mod, "get_databricks_token", self._fail_if_called)
+        monkeypatch.setattr(cli_mod, "discover_oss_models", self._fail_if_called)
+
+        code = cli_mod._run_claude_oss_probe("http://example.cloud.databricks.com", None)
+
+        assert code == 1
+        assert "non-HTTPS" in capsys.readouterr().err
+
+    def test_accepts_a_loopback_http_workspace(self, monkeypatch, capsys):
+        monkeypatch.setattr(cli_mod, "load_state", lambda: {})
+        monkeypatch.setattr(cli_mod, "ensure_databricks_auth", lambda *a, **k: None)
+        monkeypatch.setattr(cli_mod, "get_databricks_token", lambda *a, **k: "tok")
+        monkeypatch.setattr(
+            cli_mod, "discover_oss_models", lambda *a, **k: (["databricks-glm-5-2"], None)
+        )
+        # run_probe is imported inside the function body (lazy import), so it
+        # must be patched at its source module, not on cli_mod.
+        monkeypatch.setattr("ucode.agents.claude_oss.probe.run_probe", lambda *a, **k: 0)
+
+        code = cli_mod._run_claude_oss_probe("http://127.0.0.1:8080", None)
+
+        assert code == 0

@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import timedelta
 from decimal import ROUND_HALF_UP, Decimal
+from urllib.parse import urlparse
 
 import questionary
 from prompt_toolkit.formatted_text import to_formatted_text
@@ -362,6 +363,29 @@ def normalize_workspace_url(workspace: str) -> str:
     if not workspace.startswith(("http://", "https://")):
         workspace = f"https://{workspace}"
     return workspace.rstrip("/")
+
+
+_LOOPBACK_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def reject_non_https_workspace(workspace: str) -> None:
+    """Refuse a workspace URL that would send a bearer token over plaintext.
+
+    `normalize_workspace_url` deliberately preserves an explicit `http://`
+    (loopback dev/test workspaces rely on this), so it can't reject non-HTTPS
+    itself. Callers that go on to mint and send a real Databricks credential
+    to the normalized URL — an explicit `--workspace` override, most notably
+    — need this narrower check instead: HTTPS is required for a real host,
+    but loopback stays exempt since a credential sent there never leaves the
+    machine."""
+    parsed = urlparse(workspace)
+    if parsed.scheme == "https":
+        return
+    if parsed.hostname in _LOOPBACK_HOSTNAMES:
+        return
+    raise RuntimeError(
+        f"Refusing to send a Databricks credential to a non-HTTPS workspace URL: {workspace}"
+    )
 
 
 def prompt_for_workspace(

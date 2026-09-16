@@ -147,6 +147,17 @@ class TestCustomClientToken:
             )
         self.discovery.assert_not_called()
 
+    def test_a_non_https_workspace_fails_before_oidc_discovery(self):
+        # normalize_workspace_url preserves an explicit http:// (loopback
+        # dev/test workspaces rely on this), so a real host given as
+        # http://... would otherwise reach oauth.get_workspace_endpoints and
+        # drive token refresh/login over plaintext.
+        with pytest.raises(RuntimeError, match="non-HTTPS"):
+            get_custom_client_token(
+                "http://example.databricks.com", client_id="custom-client", scopes=TEST_SCOPES
+            )
+        self.discovery.assert_not_called()
+
     def test_login_failure_is_actionable_and_does_not_expose_response(self):
         self.browser.side_effect = ValueError("sensitive server response")
         with pytest.raises(RuntimeError, match="registered redirect URL") as error:

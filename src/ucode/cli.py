@@ -141,6 +141,7 @@ from ucode.ui import (
     prompt_for_workspace,
     prompt_yes_no,
     redirect_output_to_stderr,
+    reject_non_https_workspace,
     set_verbosity,
     spinner,
     status_badge,
@@ -2641,6 +2642,11 @@ def _run_claude_oss_probe(workspace_url: str | None, model: str | None) -> int:
     profile = state.get("profile")
     apply_pat_environment(state)
     try:
+        # normalize_workspace_url deliberately preserves an explicit
+        # http:// for loopback dev/test workspaces; a real host given as
+        # http://... must not reach auth, which mints and sends a real
+        # bearer token, entirely over plaintext.
+        reject_non_https_workspace(workspace)
         ensure_databricks_auth(workspace, profile)
         with spinner("Retrieving Databricks access token..."):
             token = get_databricks_token(workspace, profile)

@@ -49,13 +49,39 @@ def _post(url: str, token: str, payload: dict, *, stream: bool = False) -> tuple
         return 0, str(exc)
 
 
-def _report(name: str, status: int, body: str, *, limit: int = 400) -> bool:
-    ok = status == 200
+def _report(name: str, status: int, body: str, *, limit: int = 400, ok: bool | None = None) -> bool:
+    if ok is None:
+        ok = status == 200
     mark = "PASS" if ok else "FAIL"
     print(f"\n[{mark}] {name}  (HTTP {status})")
     snippet = " ".join(body.split())[:limit]
     print(f"       {snippet}")
     return ok
+
+
+def _has_sse_data_event(body: str) -> bool:
+    """Whether `body` contains at least one SSE `data:` line, other than
+    `[DONE]`, whose payload parses as JSON.
+
+    `claude_oss/server.py`'s `_stream` ignores any line that doesn't start
+    with `data:` entirely, so an HTTP 200 with an ordinary JSON body (no SSE
+    framing at all) would otherwise report PASS even though nothing would
+    actually reach Claude Code. `[DONE]` alone doesn't count either — that
+    only signals completion, not that a real chunk was ever delivered. Not
+    requiring `[DONE]` itself: `_stream` also completes cleanly on EOF."""
+    for line in body.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            continue
+        try:
+            json.loads(payload)
+        except ValueError:
+            continue
+        return True
+    return False
 
 
 def run_probe(workspace: str, token: str, model: str | None) -> int:
@@ -118,7 +144,8 @@ def run_probe(workspace: str, token: str, model: str | None) -> int:
         },
         stream=True,
     )
-    results["oss streaming"] = _report("OSS route, streaming", status, body)
+    stream_ok = status == 200 and _has_sse_data_event(body)
+    results["oss streaming"] = _report("OSS route, streaming", status, body, ok=stream_ok)
     if status == 200:
         has_usage = '"usage"' in body
         print(f"       stream_options usage reported: {has_usage}")
@@ -147,7 +174,11 @@ def run_probe(workspace: str, token: str, model: str | None) -> int:
                     },
                 }
             ],
-            "tool_choice": "auto",
+            # Forced, not "auto": a tool-capable model may otherwise answer in
+            # text without calling get_weather at all, which would report a
+            # false failure below rather than exercising what this check
+            # actually verifies.
+            "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
         },
     )
     ok = _report("OSS route, tool calling", status, body)
