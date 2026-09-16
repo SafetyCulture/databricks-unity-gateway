@@ -614,13 +614,13 @@ class TestSendJsonClientDisconnect(unittest.TestCase):
     callers (`_once`, `/health`, `/v1/models`, `/v1/messages/count_tokens`)
     were the one gap."""
 
-    def test_swallows_broken_pipe_on_headers(self):
+    def test_swallows_broken_pipe_on_headers(self) -> None:
         handler = _bare_handler(_BrokenPipeWriter())
         # Must not raise — a dead client is a routine teardown, not an error
         # that belongs in the user's terminal.
         handler._send_json(200, {"ok": True})
 
-    def test_swallows_connection_reset_on_the_body_write(self):
+    def test_swallows_connection_reset_on_the_body_write(self) -> None:
         class _ResetOnBody(io.RawIOBase):
             def __init__(self):
                 self.wrote_headers = False

@@ -82,6 +82,26 @@ CODEX_BACKUP_PATH = APP_DIR / "codex-ucode-config.backup.toml"
 CODEX_MODEL_CATALOG_PATH = APP_DIR / "codex-model-catalog.json"
 LEGACY_CODEX_CONFIG_PATH = CODEX_CONFIG_DIR / "config.toml"
 LEGACY_CODEX_BACKUP_PATH = APP_DIR / "codex-config.backup.toml"
+
+
+def _legacy_codex_config_path() -> Path:
+    """Where old Codex (< 0.134.0, `--profile ucode`) actually reads/writes
+    its single shared config.toml.
+
+    Codex resolves this from `$CODEX_HOME/config.toml` when CODEX_HOME is
+    set (mirroring `codex_config.py`'s own resolution for the modern,
+    --config-override launch path) — `LEGACY_CODEX_CONFIG_PATH` alone
+    ignores it, so a user with CODEX_HOME set would get a generated
+    Databricks provider config written to `~/.codex/config.toml` while the
+    launched Codex process reads its config from somewhere else entirely.
+    Falls back to the plain module constant (which tests already monkeypatch
+    directly) when CODEX_HOME isn't set."""
+    codex_home = os.environ.get("CODEX_HOME")
+    if codex_home:
+        return Path(codex_home).expanduser() / "config.toml"
+    return LEGACY_CODEX_CONFIG_PATH
+
+
 CODEX_MODEL_PROVIDER_NAME = "Databricks"
 LEGACY_CODEX_MODEL_PROVIDER_NAME = "ucode-databricks"
 _MODEL_SERVICE_ROUTING_KEY_PATHS = [
@@ -165,9 +185,10 @@ def has_ucode_config() -> bool:
     """Return whether ucode has already written a Codex configuration."""
     if CODEX_CONFIG_PATH.exists():
         return True
-    if not LEGACY_CODEX_CONFIG_PATH.exists():
+    legacy_path = _legacy_codex_config_path()
+    if not legacy_path.exists():
         return False
-    doc = read_toml_safe(LEGACY_CODEX_CONFIG_PATH)
+    doc = read_toml_safe(legacy_path)
     profiles = doc.get("profiles")
     return (
         doc.get("profile") == CODEX_PROFILE_NAME
@@ -396,11 +417,14 @@ def write_tool_config(
                 "This Codex version cannot use the managed static model catalog. "
                 "Upgrade Codex and verify `codex debug models --bundled` works, then retry."
             )
-        # Codex < 0.134.0 only reads ~/.codex/config.toml. Write the shared
-        # config with [profiles.ucode] + shared [model_providers.Databricks]
-        # and skip the per-profile-file cleanup that would normally strip
-        # ucode's entry from the shared file.
-        backup_existing_file(LEGACY_CODEX_CONFIG_PATH, LEGACY_CODEX_BACKUP_PATH)
+        # Codex < 0.134.0 only reads ~/.codex/config.toml (or
+        # $CODEX_HOME/config.toml when set — see _legacy_codex_config_path).
+        # Write the shared config with [profiles.ucode] + shared
+        # [model_providers.Databricks] and skip the per-profile-file
+        # cleanup that would normally strip ucode's entry from the shared
+        # file.
+        legacy_path = _legacy_codex_config_path()
+        backup_existing_file(legacy_path, LEGACY_CODEX_BACKUP_PATH)
         overlay = render_legacy_overlay(
             workspace,
             chosen_model,
@@ -410,7 +434,7 @@ def write_tool_config(
             parent_schema=parent_schema,
             custom_oauth=state.get("custom_oauth"),
         )
-        doc = read_toml_safe(LEGACY_CODEX_CONFIG_PATH)
+        doc = read_toml_safe(legacy_path)
         prune_key_paths(doc, _MODEL_SERVICE_ROUTING_KEY_PATHS)
         deep_merge_dict(doc, overlay)
         # deep_merge can't drop keys, so clear model preferences from an earlier run.
@@ -423,7 +447,7 @@ def write_tool_config(
             for key in ("model", "model_reasoning_effort"):
                 profiles[CODEX_PROFILE_NAME].pop(key, None)
         _set_provider_header(doc, None)
-        write_toml_file(LEGACY_CODEX_CONFIG_PATH, doc)
+        write_toml_file(legacy_path, doc)
         state = mark_tool_managed(state, "codex", LEGACY_MANAGED_KEYS)
         save_state(state)
         return state
@@ -840,7 +864,7 @@ def disable_smart_routing(state: dict) -> bool:
     if state.get("workspace"):
         save_state(state)
     changed = False
-    for path in (CODEX_CONFIG_PATH, LEGACY_CODEX_CONFIG_PATH):
+    for path in (CODEX_CONFIG_PATH, _legacy_codex_config_path()):
         if not path.exists():
             continue
         doc = read_toml_safe(path)

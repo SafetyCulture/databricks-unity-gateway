@@ -643,6 +643,11 @@ def load_managed_configuration(workspace: str | None) -> dict | None:
 
     Unlike :func:`load_managed_state` this does not normalize: it is the exact CodingAgentConfig, for
     ``ug export`` and for inspecting the on-disk file.
+
+    This is the single local managed config: a launch pulls it from the workspace (the source of
+    truth, authored there by an admin through the AI Gateway API or UI) and persists it here via
+    :func:`save_managed_state` — see the module docstring. ``ucode`` itself never authors or
+    publishes it.
     """
     if not workspace:
         return None
@@ -656,8 +661,8 @@ def load_managed_configuration(workspace: str | None) -> dict | None:
 def managed_state_workspace() -> str | None:
     """The workspace the on-disk managed config was authored/pulled for, or None when there is none.
 
-    Lets a caller that has no workspace in local ucode state (e.g. ``ucode setup --show`` before
-    ``ucode configure``) still find the manifest on disk and report which workspace it belongs to.
+    Lets a caller that has no workspace in local ucode state (e.g. before ``ucode configure`` has
+    ever run) still find the pulled manifest on disk and report which workspace it belongs to.
     """
     workspace = config_io.read_json_safe(MANAGED_CONFIG_PATH).get("workspace")
     return workspace if isinstance(workspace, str) and workspace else None
@@ -681,10 +686,11 @@ def refresh_managed_config(state: dict) -> ManagedConfigResult:
     back (see below).
 
     ``coding_agent_config_feature_disabled`` is True whenever the gateway returned ``FEATURE_DISABLED`` —
-    the coding-agent-configs feature isn't enabled server-side, so callers suppress the ``ucode
-    setup`` recommendation. A config cached from when the feature was enabled is discarded in that
-    case (returned manifest is None), so a launch doesn't re-apply a policy the workspace has turned
-    off and ``ug configure`` doesn't route into a managed-setup flow that would dead-end.
+    the coding-agent-configs feature isn't enabled server-side, so callers suppress the "no managed
+    coding agent config found" note (it would be misleading — there's no config because the feature
+    is off, not because the admin hasn't published one). A config cached from when the feature was
+    enabled is discarded in that case (returned manifest is None), so a launch doesn't re-apply a
+    policy the workspace has since turned off.
     """
     workspace = state.get("workspace")
     if not workspace:

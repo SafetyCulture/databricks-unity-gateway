@@ -3,7 +3,7 @@ from unittest.mock import patch
 from ucode.agents.claude_oss.probe import run_probe
 
 
-def test_probe_reports_translation_required_when_anthropic_route_rejects_oss_model():
+def test_probe_reports_translation_required_when_anthropic_route_rejects_oss_model() -> None:
     responses = iter(
         [
             (400, '{"message": "API type not supported"}'),  # anthropic route rejects
@@ -18,14 +18,14 @@ def test_probe_reports_translation_required_when_anthropic_route_rejects_oss_mod
     assert code == 0
 
 
-def test_probe_returns_error_code_when_no_model_to_probe():
+def test_probe_returns_error_code_when_no_model_to_probe() -> None:
     with patch("ucode.agents.claude_oss.probe._post") as post:
         code = run_probe("https://example.cloud.databricks.com", "token", None)
     post.assert_not_called()
     assert code == 1
 
 
-def test_probe_calls_post_five_times_against_the_expected_routes_in_order():
+def test_probe_calls_post_five_times_against_the_expected_routes_in_order() -> None:
     workspace = "https://example.cloud.databricks.com"
     model = "databricks-glm-5-2"
     responses = [
@@ -64,7 +64,7 @@ def test_probe_calls_post_five_times_against_the_expected_routes_in_order():
         assert call.args[2]["model"] == model
 
 
-def test_probe_forces_the_tool_call_in_the_capability_check():
+def test_probe_forces_the_tool_call_in_the_capability_check() -> None:
     """`tool_choice: "auto"` lets a tool-capable model answer in text instead
     of calling get_weather, and the probe would then report a false failure
     (it checks `"tool_calls" in body`). Force the specific function so the
@@ -87,7 +87,7 @@ def test_probe_forces_the_tool_call_in_the_capability_check():
     }
 
 
-def test_probe_reports_streaming_failure_for_a_plain_json_response(capsys):
+def test_probe_reports_streaming_failure_for_a_plain_json_response(capsys) -> None:
     """`server.py`'s _stream ignores anything that isn't an SSE `data:` line -
     a normal JSON body reaching Claude Code that way is silently dropped, not
     delivered. The probe must not report "PASS" for HTTP 200 alone."""
@@ -107,7 +107,7 @@ def test_probe_reports_streaming_failure_for_a_plain_json_response(capsys):
     assert "[FAIL] OSS route, streaming" in out
 
 
-def test_probe_reports_streaming_success_for_a_real_sse_data_event(capsys):
+def test_probe_reports_streaming_success_for_a_real_sse_data_event(capsys) -> None:
     workspace = "https://example.cloud.databricks.com"
     responses = [
         (400, '{"message": "API type not supported"}'),

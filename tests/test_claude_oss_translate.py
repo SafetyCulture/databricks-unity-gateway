@@ -369,7 +369,7 @@ class TestResponseTranslation(unittest.TestCase):
         # counted twice and Claude Code's context meter runs roughly 2x real.
         self.assertEqual(out["usage"]["input_tokens"], 40)
 
-    def test_a_near_fully_cached_turn_matches_the_real_prompt_size(self):
+    def test_a_near_fully_cached_turn_matches_the_real_prompt_size(self) -> None:
         """Live-reproduced: a real session's recorded usage showed
         input_tokens=674840, cache_read_input_tokens=674304 - nearly equal,
         meaning almost the entire prompt was served from cache and only ~536
@@ -721,10 +721,6 @@ class TestErrorsAndCounting(unittest.TestCase):
         self.assertGreaterEqual(small, 1)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestToolResultImages(unittest.TestCase):
     """Claude Code returns Read-on-an-image as a tool_result image block.
     OpenAI tool messages are text-only, so the image has to be hoisted."""
@@ -799,3 +795,7 @@ class TestToolResultImages(unittest.TestCase):
         self.assertEqual(
             out["messages"][1]["content"][1]["image_url"]["url"], "data:image/jpeg;base64,BBBB"
         )
+
+
+if __name__ == "__main__":
+    unittest.main()
