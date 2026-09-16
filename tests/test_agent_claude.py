@@ -92,6 +92,84 @@ class TestMinimumVersion:
         assert claude.minimum_version_error() is None
 
 
+class TestOssLongContextSuffix:
+    """`_maybe_add_1m_suffix` matches a Claude-only regex, so it silently never
+    fires for an OSS id — leaving Claude Code on its assumed 200k default for a
+    1M-context model. `_oss_model_name` drives the decision off the context
+    window `ucode.databricks.model_token_limits` already records instead."""
+
+    def test_the_claude_only_regex_does_not_match_oss_ids(self):
+        # The reason this fix is needed at all, asserted so a future regex
+        # change can't quietly make the OSS helper look redundant.
+        assert claude._CLAUDE_MODEL_RE.match("databricks-glm-5-2") is None
+        assert claude._CLAUDE_MODEL_RE.match("databricks-kimi-k3") is None
+
+    def test_a_1m_context_oss_model_gets_the_suffix(self):
+        assert claude._oss_model_name("databricks-glm-5-2") == "databricks-glm-5-2[1m]"
+        assert claude._oss_model_name("databricks-kimi-k3") == "databricks-kimi-k3[1m]"
+
+    def test_a_smaller_context_oss_model_does_not(self):
+        # 128k per the model_token_limits `kimi` family entry.
+        assert claude._oss_model_name("databricks-kimi-k2-7-code") == "databricks-kimi-k2-7-code"
+        assert claude._oss_model_name("databricks-inkling-1") == "databricks-inkling-1"
+
+    def test_an_unknown_oss_model_does_not(self):
+        # No known limits means no claim about the window.
+        assert claude._oss_model_name("databricks-mystery-1") == "databricks-mystery-1"
+
+    def test_an_already_suffixed_id_is_not_doubled(self):
+        assert claude._oss_model_name("databricks-glm-5-2[1m]") == "databricks-glm-5-2[1m]"
+
+    def test_real_claude_ids_keep_the_existing_helpers_behaviour(self):
+        # Other callers (render_overlay, smart routing v2) depend on this.
+        assert (
+            claude._maybe_add_1m_suffix("databricks-claude-opus-4-8")
+            == "databricks-claude-opus-4-8[1m]"
+        )
+        assert claude._maybe_add_1m_suffix("databricks-glm-5-2") == "databricks-glm-5-2"
+
+
+class TestAssignOssModelTiers:
+    """Claude Code's /model picker only ever shows 3 rows, and native gateway
+    discovery cannot add more (see the plan doc's post-merge follow-up note -
+    Claude Code's own discovery parser silently drops non-Claude-family ids).
+    So with up to 6 OSS models on a real workspace, the 3 tiers have to make a
+    deliberate choice rather than discover one."""
+
+    def test_the_live_safetyculture_catalogue(self):
+        # The exact 6-model catalogue this workspace has today.
+        models = [
+            "databricks-glm-5-2",
+            "databricks-glm-5-3",
+            "databricks-glm-5-3-flash",
+            "databricks-inkling",
+            "databricks-kimi-k2-7-code",
+            "databricks-kimi-k3",
+        ]
+        opus, sonnet, haiku = claude._assign_oss_model_tiers(models)
+        assert opus == "databricks-kimi-k3"
+        assert sonnet == "databricks-glm-5-3"
+        assert haiku == "databricks-glm-5-3-flash"
+
+    def test_falls_back_to_the_quality_glm_when_there_is_no_flash_variant(self):
+        models = ["databricks-glm-5-2", "databricks-kimi-k3"]
+        opus, sonnet, haiku = claude._assign_oss_model_tiers(models)
+        assert opus == "databricks-kimi-k3"
+        assert sonnet == "databricks-glm-5-2"
+        assert haiku == "databricks-glm-5-2"
+
+    def test_falls_back_to_glm_when_there_is_no_kimi_at_all(self):
+        models = ["databricks-glm-5-3", "databricks-glm-5-3-flash"]
+        opus, sonnet, haiku = claude._assign_oss_model_tiers(models)
+        assert opus == "databricks-glm-5-3"
+        assert sonnet == "databricks-glm-5-3"
+        assert haiku == "databricks-glm-5-3-flash"
+
+    def test_a_single_model_backs_every_tier(self):
+        opus, sonnet, haiku = claude._assign_oss_model_tiers(["databricks-inkling"])
+        assert opus == sonnet == haiku == "databricks-inkling"
+
+
 class TestRenderOverlay:
     def test_long_context_suffix_supports_major_only_claude_versions(self):
         assert claude._maybe_add_1m_suffix("system.ai.claude-sonnet-5") == (
@@ -488,6 +566,22 @@ class TestRenderOverlay:
         overlay, _ = claude.render_overlay(WS, "s4", static_models=static)
         labels = [opt["label"] for opt in overlay["modelPicker"]["options"]]
         assert labels == ["claude-opus-4-8", "databricks-custom-model"]
+
+    def test_render_overlay_points_at_the_oss_shim_when_given_a_base_url(self):
+        overlay, keys = claude.render_overlay(
+            "https://safetyculture-safetyculture-production.cloud.databricks.com",
+            None,
+            {},
+            provider_models={"opus": "databricks-glm-5-2[1m]", "sonnet": "databricks-kimi-k3[1m]"},
+            oss_shim_base_url="http://127.0.0.1:54321",
+        )
+        assert overlay["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:54321"
+        assert overlay["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "databricks-glm-5-2[1m]"
+        assert overlay["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-kimi-k3[1m]"
+        # The shim authenticates to Databricks itself; Claude Code must not be
+        # told to run a gateway apiKeyHelper that would try to reach it directly.
+        assert "apiKeyHelper" not in overlay
+        assert ["apiKeyHelper"] not in keys
 
 
 class TestRenderOverlayUserAgent:
@@ -1005,6 +1099,186 @@ class TestWriteToolConfigManagedSettings:
         assert managed_writes == []
         assert warns == []
 
+    def test_oss_shim_skips_managed_write_across_consecutive_launches(self, monkeypatch):
+        """The OSS shim's loopback server only runs inside `_launch_oss_shim` and
+        binds a fresh random port each launch, so mirroring its base URL into the
+        root-owned managed file would rewrite that file (a sudo prompt) on every
+        launch from the second onwards, and leave a dead loopback URL in the
+        highest-precedence scope for every bare `claude` afterwards. Same property
+        as relayed, so the same skip."""
+        private_writes: list = []
+        managed_writes: list = []
+        warns: list = []
+        self._patch(monkeypatch, private_writes, managed_writes)
+        monkeypatch.setattr(claude, "print_warning", lambda msg: warns.append(msg))
+        state = {"workspace": WS, "codex_models": [], "claude_oss_fallback": True}
+
+        for port in (54321, 61234):
+            claude.write_tool_config(
+                state,
+                None,
+                provider_models={"opus": "databricks-glm-5-2[1m]"},
+                oss_shim_base_url=f"http://127.0.0.1:{port}",
+            )
+
+        assert managed_writes == []
+        assert warns == []
+        # The per-launch settings file still tracks whichever port is live.
+        assert private_writes[-1][1]["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:61234"
+
+    def test_oss_shim_records_a_managed_scope_of_its_own(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        verified: list = []
+        self._patch(monkeypatch, private_writes, managed_writes)
+        monkeypatch.setattr(
+            claude,
+            "mark_managed_file_verified",
+            lambda state, tool, path, **kwargs: verified.append(
+                (tool, str(path), kwargs.get("scope"))
+            ),
+        )
+        state = {"workspace": WS, "codex_models": []}
+
+        claude.write_tool_config(
+            state,
+            None,
+            provider_models={"opus": "databricks-glm-5-2[1m]"},
+            oss_shim_base_url="http://127.0.0.1:54321",
+        )
+
+        assert verified == [("claude", str(FAKE_MANAGED_PATH), "oss-shim-compatible")]
+
+    def test_pre_launch_configure_also_skips_the_managed_write_in_oss_fallback(self, monkeypatch):
+        """Live-reproduced: `configure_tool`'s claude branch calls write_tool_config
+        BEFORE the shim's port exists (oss_shim_base_url=None), so `bool(oss_shim_base_url)`
+        alone can't tell this write apart from an ordinary direct-gateway configure. Without
+        also checking `claude_oss_fallback`, this first call took the regular write path and
+        wrote a real apiKeyHelper + real gateway ANTHROPIC_BASE_URL into the managed file -
+        which `_launch_oss_shim`'s own later call (which DOES pass oss_shim_base_url) never
+        gets a chance to undo, since it correctly skips the managed file entirely. Net effect
+        on a real machine: `ucode revert` clears the managed file, and the very next
+        `ug claude` silently rewrites the exact same conflict before ever reaching
+        `_launch_oss_shim` - permanently un-fixable by revert alone."""
+        private_writes: list = []
+        managed_writes: list = []
+        self._patch(monkeypatch, private_writes, managed_writes)
+        state = {"workspace": WS, "codex_models": [], "claude_oss_fallback": True}
+
+        # The pre-launch call: no oss_shim_base_url yet, matching configure_tool's
+        # actual claude branch (agents/__init__.py) exactly.
+        claude.write_tool_config(state, None)
+
+        assert managed_writes == []
+
+    def test_oss_shim_fails_fast_on_a_genuine_managed_base_url_conflict(self, monkeypatch):
+        """Live-confirmed failure mode: a managed env.ANTHROPIC_BASE_URL pointing at the
+        real Anthropic gateway route (left over from ordinary, pre-OSS-fallback Claude
+        usage on this machine) outranks both the per-launch settings file and the shim's
+        loopback URL in the process env. Claude Code then sends OSS model ids straight to
+        the real gateway, which 400s: "API type 'anthropic/v1/messages' is not supported
+        by 'databricks-kimi-k3'". Skipping the managed write (as ucode does for this path)
+        must not also skip detecting this — fail at configure time instead, like relayed
+        already does for the equivalent risk."""
+        private_writes: list = []
+        managed_writes: list = []
+        existing = {
+            str(FAKE_MANAGED_PATH): {
+                "env": {
+                    "ANTHROPIC_BASE_URL": f"{WS}/ai-gateway/anthropic",
+                },
+                "apiKeyHelper": "/Users/joshw/.local/bin/ucode auth-token --host " + WS,
+            }
+        }
+        self._patch(monkeypatch, private_writes, managed_writes, existing)
+        state = {"workspace": WS, "codex_models": [], "claude_oss_fallback": True}
+
+        with pytest.raises(RuntimeError, match="run `ucode revert`"):
+            claude.write_tool_config(
+                state,
+                None,
+                provider_models={"opus": "databricks-glm-5-2[1m]"},
+                oss_shim_base_url="http://127.0.0.1:54321",
+            )
+
+        assert managed_writes == []
+
+    def test_oss_shim_ignores_a_stale_loopback_url_in_the_managed_file(self, monkeypatch):
+        """The counterpart to the fail-fast test above: a managed
+        env.ANTHROPIC_BASE_URL that is ALREADY a loopback URL is ucode's own harmless
+        leftover from an earlier relayed/OSS-shim session (the managed write has been
+        skipped for both modes since the fix that made this path reachable at all), not
+        a genuine external conflict — must not block the launch."""
+        private_writes: list = []
+        managed_writes: list = []
+        existing = {
+            str(FAKE_MANAGED_PATH): {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:11111"}}
+        }
+        self._patch(monkeypatch, private_writes, managed_writes, existing)
+        state = {"workspace": WS, "codex_models": [], "claude_oss_fallback": True}
+
+        claude.write_tool_config(
+            state,
+            None,
+            provider_models={"opus": "databricks-glm-5-2[1m]"},
+            oss_shim_base_url="http://127.0.0.1:54321",
+        )
+
+        assert managed_writes == []
+
+    def test_oss_shim_stays_usable_noninteractively_after_an_interactive_launch(self, monkeypatch):
+        """A prior interactive OSS launch could leave its (now dead) loopback port
+        in the managed file. Non-interactively `managed_file_conflicts` would then
+        compare that stale port against the live one and hard-fail every
+        `ug claude` forever. Skipping the mirror entirely removes the conflict."""
+        private_writes: list = []
+        managed_writes: list = []
+        existing = {
+            str(FAKE_MANAGED_PATH): {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:11111"}}
+        }
+        self._patch(monkeypatch, private_writes, managed_writes, existing)
+        monkeypatch.setattr(claude, "managed_writes_allowed", lambda: False)
+        state = {"workspace": WS, "codex_models": [], "claude_oss_fallback": True}
+
+        claude.write_tool_config(
+            state,
+            None,
+            provider_models={"opus": "databricks-glm-5-2[1m]"},
+            oss_shim_base_url="http://127.0.0.1:22222",
+        )
+
+        assert managed_writes == []
+
+    def test_oss_shim_leaves_stale_claude_model_pins_in_the_managed_file_untouched(
+        self, monkeypatch
+    ):
+        """`_enforce_model_default_hierarchy` derives `ucode_defaults` from
+        `state["claude_models"]`, which is empty in OSS-fallback mode, so it would
+        fall through to whatever Claude ids the managed file already holds — i.e.
+        write back stale Claude pins while the live per-launch settings file holds
+        the GLM/Kimi ones. Skipping the managed write makes that unreachable."""
+        private_writes: list = []
+        managed_writes: list = []
+        existing = {
+            str(FAKE_MANAGED_PATH): {
+                "env": {"ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8"}
+            }
+        }
+        self._patch(monkeypatch, private_writes, managed_writes, existing)
+        state = {"workspace": WS, "codex_models": [], "claude_models": {}}
+
+        claude.write_tool_config(
+            state,
+            None,
+            provider_models={"opus": "databricks-glm-5-2[1m]", "sonnet": "databricks-kimi-k3[1m]"},
+            oss_shim_base_url="http://127.0.0.1:54321",
+        )
+
+        assert managed_writes == []
+        private_env = private_writes[-1][1]["env"]
+        assert private_env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "databricks-glm-5-2[1m]"
+        assert private_env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-kimi-k3[1m]"
+
     def test_relayed_fails_on_conflicting_managed_auth(self, monkeypatch):
         private_writes: list = []
         managed_writes: list = []
@@ -1027,6 +1301,27 @@ class TestWriteToolConfigManagedSettings:
         state = {"workspace": WS, "codex_models": []}
 
         with pytest.raises(RuntimeError, match="Cannot safely inspect"):
+            claude.write_tool_config(state, "databricks-claude-sonnet-4", relayed=True)
+
+        assert managed_writes == []
+
+    def test_relayed_rejects_a_non_string_managed_base_url(self, monkeypatch):
+        """A number or object in `env.ANTHROPIC_BASE_URL` must not raise
+        AttributeError from `base_url.startswith(...)` - the managed file is
+        admin-authored, external input, and this function's documented
+        contract is a RuntimeError naming the conflict, not an unhandled
+        crash that skips the actionable "repair the file or contact your
+        administrator" message."""
+        private_writes: list = []
+        managed_writes: list = []
+        self._patch(monkeypatch, private_writes, managed_writes)
+        monkeypatch.setattr(
+            claude, "read_managed_file", lambda path: '{"env": {"ANTHROPIC_BASE_URL": 12345}}'
+        )
+        monkeypatch.setattr(claude, "relayed_proxy_base_url", lambda state: "http://127.0.0.1:9999")
+        state = {"workspace": WS, "codex_models": []}
+
+        with pytest.raises(RuntimeError, match="run `ucode revert`"):
             claude.write_tool_config(state, "databricks-claude-sonnet-4", relayed=True)
 
         assert managed_writes == []
@@ -1460,6 +1755,235 @@ class TestClaudeLaunch:
         )
         assert calls[-3:] == [("stop",), ("shutdown",), ("close",)]
 
+    def test_launch_oss_shim_fails_explicitly_when_there_are_no_oss_models(self, monkeypatch):
+        """`claude_oss_fallback` and `oss_models` are separate state keys, so a
+        state that has the flag but an empty/missing model list is reachable
+        (e.g. state persisted by an older build, or a path that recomputes one
+        but not the other). Without this guard, `_assign_oss_model_tiers`
+        falls through to `oss_models[0]` and crashes with an IndexError that
+        `_launch_tool` doesn't catch (it only catches RuntimeError) - a
+        confusing crash instead of the intended "no models available" error."""
+        state = {"workspace": "https://example.cloud.databricks.com", "oss_models": []}
+
+        with pytest.raises(RuntimeError, match="no OSS models"):
+            claude._launch_oss_shim(state, "claude", [])
+
+    def test_launch_oss_shim_starts_the_server_and_runs_claude_against_it(
+        self, monkeypatch, tmp_path
+    ):
+        state = {
+            "workspace": "https://example.cloud.databricks.com",
+            "oss_models": ["databricks-glm-5-2", "databricks-kimi-k3"],
+        }
+        started = {}
+
+        class FakeProc:
+            returncode = 0
+
+            def wait(self):
+                return 0
+
+        def fake_popen(argv, **kwargs):
+            started["argv"] = argv
+            started["env"] = kwargs.get("env")
+            return FakeProc()
+
+        monkeypatch.setattr(claude.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *a, **k: "fake-token")
+        # TokenCache._refresh calls gateway_proxy's own bound import of
+        # get_databricks_token, not claude's — patch it there too so
+        # constructing the shim's TokenCache doesn't shell out for real.
+        monkeypatch.setattr(
+            claude.gateway_proxy, "get_databricks_token", lambda *a, **k: "fake-token"
+        )
+        written: list = []
+        monkeypatch.setattr(claude, "write_tool_config", lambda *a, **k: written.append(k) or {})
+
+        with pytest.raises(SystemExit) as exc:
+            claude._launch_oss_shim(state, "claude", [])
+
+        assert exc.value.code == 0
+        assert started["env"]["ANTHROPIC_BASE_URL"].startswith("http://127.0.0.1:")
+        # Exact ids, suffix included: GLM and Kimi K3 are both 1M-context, and the
+        # `[1m]` suffix is the only thing that tells Claude Code so (it assumes
+        # 200k otherwise and auto-compacts five times too early). Opus = Kimi
+        # (flagship), Sonnet/Haiku fall back to the one available GLM since this
+        # workspace has no separate flash variant (see _assign_oss_model_tiers).
+        assert started["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "databricks-kimi-k3[1m]"
+        assert started["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-glm-5-2[1m]"
+        assert started["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "databricks-glm-5-2[1m]"
+        # The same ids reach the settings file Claude Code reads.
+        assert written[0]["provider_models"] == {
+            "opus": "databricks-kimi-k3[1m]",
+            "sonnet": "databricks-glm-5-2[1m]",
+            "haiku": "databricks-glm-5-2[1m]",
+        }
+
+    def test_launch_oss_shim_strips_env_that_would_bypass_it(self, monkeypatch, tmp_path):
+        """A real Anthropic credential or a native Bedrock/Vertex routing flag
+        anywhere in the parent shell environment must not survive into the child:
+        either would give Claude Code a way to reach a real Claude model directly,
+        ignoring ANTHROPIC_BASE_URL entirely. ANTHROPIC_BASE_URL redirection is the
+        ONLY mechanism this whole launch mode relies on to guarantee traffic goes
+        through the shim, so anything that can make Claude Code route around it
+        defeats the entire point silently - the session would still show
+        "databricks-kimi-k3[1m]" as the selected model while actually talking to
+        real Anthropic/Bedrock/Vertex."""
+        state = {
+            "workspace": "https://example.cloud.databricks.com",
+            "oss_models": ["databricks-glm-5-2", "databricks-kimi-k3"],
+        }
+        started = {}
+
+        class FakeProc:
+            returncode = 0
+
+            def wait(self):
+                return 0
+
+        def fake_popen(argv, **kwargs):
+            started["env"] = kwargs.get("env")
+            return FakeProc()
+
+        monkeypatch.setattr(claude.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *a, **k: "fake-token")
+        monkeypatch.setattr(
+            claude.gateway_proxy, "get_databricks_token", lambda *a, **k: "fake-token"
+        )
+        monkeypatch.setattr(claude, "write_tool_config", lambda *a, **k: {})
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-a-real-looking-key")
+        monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+        monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "1")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "some-other-session")
+        monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "some-other-entrypoint")
+        # A harmless, unrelated var must NOT be swept up by whatever strips these.
+        monkeypatch.setenv("SOME_UNRELATED_VAR", "keep-me")
+
+        with pytest.raises(SystemExit):
+            claude._launch_oss_shim(state, "claude", [])
+
+        for key in (
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_ENTRYPOINT",
+        ):
+            assert key not in started["env"], f"{key} must not reach the Claude Code child"
+        assert started["env"]["SOME_UNRELATED_VAR"] == "keep-me"
+
+    def test_launch_oss_shim_enables_gateway_model_discovery(self, monkeypatch, tmp_path):
+        """OSS-fallback launches always turn on Claude Code's native
+        CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY, unconditionally (not gated
+        behind the opt-in --enable-model-discovery flag that the normal,
+        non-shim Claude path uses) - the shim's own /v1/models endpoint exists
+        specifically to serve this, and there is no reason to hide the full
+        catalogue behind a flag when the shim is already running."""
+        state = {
+            "workspace": "https://example.cloud.databricks.com",
+            "oss_models": ["databricks-glm-5-2", "databricks-kimi-k3"],
+        }
+        started = {}
+
+        class FakeProc:
+            returncode = 0
+
+            def wait(self):
+                return 0
+
+        def fake_popen(argv, **kwargs):
+            started["env"] = kwargs.get("env")
+            return FakeProc()
+
+        monkeypatch.setattr(claude.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *a, **k: "fake-token")
+        monkeypatch.setattr(
+            claude.gateway_proxy, "get_databricks_token", lambda *a, **k: "fake-token"
+        )
+        monkeypatch.setattr(claude, "write_tool_config", lambda *a, **k: {})
+        monkeypatch.delenv("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", raising=False)
+
+        with pytest.raises(SystemExit):
+            claude._launch_oss_shim(state, "claude", [])
+
+        assert started["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
+
+    def test_launch_oss_shim_sets_a_placeholder_auth_token_for_discovery(
+        self, monkeypatch, tmp_path
+    ):
+        """Live-reproduced: Claude Code's own debug log says
+        '[gatewayDiscovery] skipped: no credential (ANTHROPIC_AUTH_TOKEN,
+        apiKeyHelper, or API key)' - CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY
+        alone is not sufficient, Claude Code also requires ONE of those three
+        credential mechanisms to be present before it will call /v1/models at
+        all, and the OSS shim deliberately sets none of them (no apiKeyHelper,
+        real ANTHROPIC_API_KEY stripped). A placeholder ANTHROPIC_AUTH_TOKEN
+        satisfies that check with no security cost: the shim never reads the
+        incoming Authorization header (see _open_upstream, which builds its own
+        from the workspace token cache), so Claude Code can send anything."""
+        state = {
+            "workspace": "https://example.cloud.databricks.com",
+            "oss_models": ["databricks-glm-5-2", "databricks-kimi-k3"],
+        }
+        started = {}
+
+        class FakeProc:
+            returncode = 0
+
+            def wait(self):
+                return 0
+
+        def fake_popen(argv, **kwargs):
+            started["env"] = kwargs.get("env")
+            return FakeProc()
+
+        monkeypatch.setattr(claude.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *a, **k: "fake-token")
+        monkeypatch.setattr(
+            claude.gateway_proxy, "get_databricks_token", lambda *a, **k: "fake-token"
+        )
+        monkeypatch.setattr(claude, "write_tool_config", lambda *a, **k: {})
+
+        with pytest.raises(SystemExit):
+            claude._launch_oss_shim(state, "claude", [])
+
+        assert started["env"].get("ANTHROPIC_AUTH_TOKEN")
+
+    def test_launch_oss_shim_omits_the_1m_suffix_for_a_smaller_context_model(
+        self, monkeypatch, tmp_path
+    ):
+        """A workspace whose only Kimi is the 128k K2 must not be advertised as
+        1M — the suffix is a claim about the window, not decoration. Kimi backs
+        Opus (see _assign_oss_model_tiers), so it's Opus that must stay bare."""
+        state = {
+            "workspace": "https://example.cloud.databricks.com",
+            "oss_models": ["databricks-glm-5-2", "databricks-kimi-k2-7-code"],
+        }
+        started = {}
+
+        class FakeProc:
+            returncode = 0
+
+            def wait(self):
+                return 0
+
+        def fake_popen(argv, **kwargs):
+            started["env"] = kwargs.get("env")
+            return FakeProc()
+
+        monkeypatch.setattr(claude.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *a, **k: "fake-token")
+        monkeypatch.setattr(
+            claude.gateway_proxy, "get_databricks_token", lambda *a, **k: "fake-token"
+        )
+        monkeypatch.setattr(claude, "write_tool_config", lambda *a, **k: {})
+
+        with pytest.raises(SystemExit):
+            claude._launch_oss_shim(state, "claude", [])
+
+        assert started["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "databricks-kimi-k2-7-code"
+        assert started["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-glm-5-2[1m]"
+
     def test_smart_routing_on_windows_is_not_supported(self, monkeypatch):
         monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.setattr(claude.os, "name", "nt")
@@ -1579,6 +2103,202 @@ class TestClaudeLaunch:
 
         assert os.environ["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
         assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"]]
+
+
+class TestWriteToolConfigClearsStaleOssFallback:
+    """`claude_oss_fallback` is only ever recomputed by `configure_shared_state`'s
+    full discovery, which a provider/managed-config launch skips entirely
+    (`skip_model_discovery`). A workspace that once had no Claude models could
+    therefore carry a stale `claude_oss_fallback=True` forever, and
+    `claude.launch()` would keep dispatching to `_launch_oss_shim` — silently
+    clobbering the provider/managed settings.json this call is writing — long
+    after a provider or a real (managed) model made the shim unnecessary.
+    `write_tool_config` must drop the stale flag whenever it's given something
+    that stands in for it (a provider, a relay, or a real model), but must
+    NOT drop it on the one write shape that means "still on the shim path":
+    `_launch_oss_shim`'s own write, and the pre-launch write that precedes it,
+    both call this with model=None, provider=None, relayed=False."""
+
+    @staticmethod
+    def _patch(monkeypatch):
+        monkeypatch.setattr(claude, "backup_existing_file", lambda *a, **kw: True)
+        monkeypatch.setattr(claude, "read_json_safe", lambda path: {})
+        monkeypatch.setattr(claude, "write_json_file", lambda *a, **kw: None)
+        monkeypatch.setattr(claude, "save_state", lambda state: None)
+
+    def test_a_provider_configure_clears_a_stale_flag(self, monkeypatch):
+        self._patch(monkeypatch)
+        state = {"workspace": WS, "claude_models": {}, "claude_oss_fallback": True}
+
+        result = claude.write_tool_config(state, None, provider="my-provider-service")
+
+        assert result.get("claude_oss_fallback") is not True
+
+    def test_a_real_managed_model_configure_clears_a_stale_flag(self, monkeypatch):
+        """Closes a gap a literal "clear when provider or relayed" fix would
+        have missed: an admin-managed config that supplies a real Claude
+        model with NO provider service is also not the OSS shim."""
+        self._patch(monkeypatch)
+        state = {"workspace": WS, "claude_models": {}, "claude_oss_fallback": True}
+
+        result = claude.write_tool_config(state, "databricks-claude-opus-4-8")
+
+        assert result.get("claude_oss_fallback") is not True
+
+    def test_a_route_root_model_configure_clears_a_stale_flag(self, monkeypatch):
+        """A managed/smart-routing pick delivered via route_root_model (rather
+        than the positional `model`) is just as real a non-shim config."""
+        self._patch(monkeypatch)
+        state = {"workspace": WS, "claude_models": {}, "claude_oss_fallback": True}
+
+        result = claude.write_tool_config(
+            state, None, route_root_model="databricks-claude-opus-4-8"
+        )
+
+        assert result.get("claude_oss_fallback") is not True
+
+    def test_managed_config_defaults_alone_clears_a_stale_flag(self, monkeypatch):
+        """Closes a further gap found on re-review: a manifest can supply
+        Claude's per-family models purely via coding_agent_config_defaults
+        without also setting default_model — schema-valid whenever claude
+        isn't the manifest's default_agent, and reachable via
+        `ucode publish -f <file>` (not just the interactive wizard, which
+        always pairs the two). That call has provider/relayed/model/
+        route_root_model/custom_model all falsy, so only
+        coding_agent_config_defaults distinguishes it from the OSS shim's own
+        write."""
+        self._patch(monkeypatch)
+        state = {"workspace": WS, "claude_models": {}, "claude_oss_fallback": True}
+
+        result = claude.write_tool_config(
+            state,
+            None,
+            coding_agent_config_defaults={"opus": "databricks-claude-opus-4-8"},
+        )
+
+        assert result.get("claude_oss_fallback") is not True
+
+    def test_launch_after_a_managed_defaults_only_configure_does_not_dispatch_to_the_oss_shim(
+        self, monkeypatch
+    ):
+        """End to end for the coding_agent_config_defaults-only scenario,
+        mirroring the provider-configure launch test above."""
+        self._patch(monkeypatch)
+        state = {"workspace": WS, "claude_models": {}, "claude_oss_fallback": True}
+        state = claude.write_tool_config(
+            state,
+            None,
+            coding_agent_config_defaults={"opus": "databricks-claude-opus-4-8"},
+        )
+        assert state.get("claude_oss_fallback") is not True
+
+        oss_shim_calls: list = []
+        exec_calls: list = []
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
+        monkeypatch.setattr(claude, "_launch_oss_shim", lambda *a, **k: oss_shim_calls.append(a))
+        monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: exec_calls.append(argv))
+
+        claude.launch(state, ["--debug"], options=LaunchOptions())
+
+        assert oss_shim_calls == []
+        assert exec_calls  # reached the normal (non-shim) dispatch instead
+
+    def test_the_oss_shims_own_configure_write_keeps_the_flag(self, monkeypatch):
+        """Regression guard for the critical failure mode a naive fix would
+        introduce: both `_launch_oss_shim`'s own write and the pre-launch
+        write inside `_launch_tool` that precedes it call this with
+        model=None, provider=None, relayed=False — clearing the flag here
+        would pull it out from under the very launch it's meant to enable,
+        because `claude.launch()` reads it right after this returns."""
+        self._patch(monkeypatch)
+        state = {"workspace": WS, "claude_models": {}, "claude_oss_fallback": True}
+
+        result = claude.write_tool_config(
+            state,
+            None,
+            provider_models={"opus": "databricks-glm-5-2", "sonnet": "databricks-kimi-k3"},
+            oss_shim_base_url="http://127.0.0.1:12345",
+        )
+
+        assert result.get("claude_oss_fallback") is True
+
+    def test_launch_after_a_provider_configure_does_not_dispatch_to_the_oss_shim(self, monkeypatch):
+        """End to end: the exact staleness sequence the reviewer described —
+        claude_oss_fallback=True persisted from a prior OSS-fallback
+        discovery, then a provider configure — must make the very next
+        `claude.launch()` skip `_launch_oss_shim` entirely, not just clear
+        the flag in isolation."""
+        self._patch(monkeypatch)
+        state = {"workspace": WS, "claude_models": {}, "claude_oss_fallback": True}
+        state = claude.write_tool_config(state, None, provider="my-provider-service")
+        assert state.get("claude_oss_fallback") is not True
+
+        oss_shim_calls: list = []
+        exec_calls: list = []
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
+        monkeypatch.setattr(claude, "_launch_oss_shim", lambda *a, **k: oss_shim_calls.append(a))
+        monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: exec_calls.append(argv))
+
+        claude.launch(state, ["--debug"], options=LaunchOptions())
+
+        assert oss_shim_calls == []
+        assert exec_calls  # reached the normal (non-shim) dispatch instead
+
+
+class TestWriteToolConfigPrunesStaleApiKeyHelper:
+    """`render_overlay` omits `apiKeyHelper` for both credential-less paths
+    (relayed and the OSS shim), but `deep_merge_dict` keeps whatever the file
+    already has — and on the OSS path the file always has one, written moments
+    earlier by the pre-launch `configure_tool` call, which runs before the shim's
+    port exists and so passes `oss_shim_base_url=None`. It has to be popped from
+    the merge result, not merely left out of the overlay."""
+
+    def _patch(self, monkeypatch, existing_settings):
+        monkeypatch.setattr(claude, "backup_existing_file", lambda *a, **kw: True)
+        monkeypatch.setattr(
+            claude, "read_json_safe", lambda path: json.loads(json.dumps(existing_settings))
+        )
+        written: dict = {}
+        monkeypatch.setattr(
+            claude, "write_json_file", lambda path, payload: written.update(payload=payload)
+        )
+        monkeypatch.setattr(claude, "save_state", lambda state: None)
+        monkeypatch.setattr(claude, "_register_web_search_mcp", lambda *a, **kw: True)
+        return written
+
+    def test_oss_shim_drops_the_helper_the_prelaunch_configure_left_behind(self, monkeypatch):
+        existing = {"apiKeyHelper": "databricks auth token --host ...", "env": {}}
+        written = self._patch(monkeypatch, existing)
+        state = {"workspace": WS, "claude_models": {}, "claude_oss_fallback": True}
+
+        claude.write_tool_config(
+            state,
+            None,
+            provider_models={"opus": "databricks-glm-5-2[1m]"},
+            oss_shim_base_url="http://127.0.0.1:54321",
+        )
+
+        assert "apiKeyHelper" not in written["payload"]
+
+    def test_a_normal_launch_still_writes_the_gateway_helper(self, monkeypatch):
+        written = self._patch(monkeypatch, {})
+        state = {"workspace": WS, "claude_models": {"opus": "databricks-claude-opus-4-8"}}
+
+        claude.write_tool_config(state, "databricks-claude-opus-4-8")
+
+        assert written["payload"]["apiKeyHelper"]
+
+    def test_relayed_drops_the_helper_too(self, monkeypatch):
+        """The pre-existing half of the same rule, pinned so the OR condition
+        can't be narrowed back to OSS-only."""
+        existing = {"apiKeyHelper": "databricks auth token --host ...", "env": {}}
+        written = self._patch(monkeypatch, existing)
+        monkeypatch.setattr(claude, "relayed_proxy_base_url", lambda state: "http://127.0.0.1:9999")
+        state = {"workspace": WS, "claude_models": {}}
+
+        claude.write_tool_config(state, None, relayed=True)
+
+        assert "apiKeyHelper" not in written["payload"]
 
 
 class TestWriteToolConfigPrunesStaleModelEnv:

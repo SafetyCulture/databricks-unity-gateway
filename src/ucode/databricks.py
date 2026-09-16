@@ -1152,6 +1152,18 @@ def ensure_databricks_auth(
     run_databricks_login(workspace, profile)
 
 
+def _command_executable_name(command: str) -> str:
+    """The bearer command's executable name only — never the full command
+    line, which commonly carries a credential argument (e.g. `broker
+    --api-key <secret>`) that must not reach a RuntimeError's text, and from
+    there stderr/CI logs. Splits on whitespace rather than reusing the
+    already-parsed argv: that parse can fail (or, on Windows, is never a
+    list at all) before an executable name is available, and this must work
+    either way."""
+    stripped = command.strip()
+    return stripped.split(None, 1)[0] if stripped else "(empty command)"
+
+
 def _bearer_from_command(command: str) -> str:
     """Run ``DATABRICKS_BEARER_COMMAND`` and return the bearer it prints.
 
@@ -1160,6 +1172,7 @@ def _bearer_from_command(command: str) -> str:
     would report a misleading stale-login error instead of the real cause.
     Mirrors how ``auth-token --use-pat`` fails closed for the same reason."""
     _debug("get_databricks_token", "using DATABRICKS_BEARER_COMMAND")
+    executable = _command_executable_name(command)
     try:
         # Windows takes the command line as one string and lets CreateProcess
         # split it: shlex's POSIX rules would eat the backslashes in `C:\...`,
@@ -1176,7 +1189,7 @@ def _bearer_from_command(command: str) -> str:
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         raise RuntimeError(
             f"DATABRICKS_BEARER_COMMAND could not be run: {type(exc).__name__}: {exc}. "
-            f"Command: {command}"
+            f"Command: {executable}"
         ) from exc
     # Deliberately not _format_subprocess_result: that includes stdout on a
     # non-zero exit, and this command's stdout is the bearer itself.
@@ -1189,7 +1202,7 @@ def _bearer_from_command(command: str) -> str:
     # diagnostic, not a bearer, and forwarding it only resurfaces as a 401.
     reason = f"exited {result.returncode}" if result.returncode else "printed no token"
     detail = f" Stderr: {stderr}" if stderr else ""
-    raise RuntimeError(f"DATABRICKS_BEARER_COMMAND {reason}. Command: {command}.{detail}")
+    raise RuntimeError(f"DATABRICKS_BEARER_COMMAND {reason}. Command: {executable}.{detail}")
 
 
 def get_databricks_token(
@@ -1352,13 +1365,19 @@ def _looks_like_cli_permission_error(stderr: str | None) -> bool:
     """Whether a Databricks CLI stderr indicates an authorization failure.
 
     The CLI exit code is generic, so we match on the stable markers the CLI/API emit
-    for a denied workspace call rather than the status alone."""
+    for a denied workspace call rather than the status alone.
+
+    Deliberately does NOT match a bare "unauthorized": a short-lived OAuth
+    token expiring reports `401 Unauthorized`, which is an authentication
+    failure needing re-login, not a permission denial. Classifying it as
+    PermissionDeniedError makes `_discover_mcp_source` silently skip the
+    source instead of surfacing the real cause."""
     if not stderr:
         return False
     lowered = stderr.lower()
     if "permission" in lowered and ("denied" in lowered or "insufficient" in lowered):
         return True
-    return "403" in lowered or "not authorized" in lowered or "unauthorized" in lowered
+    return "403" in lowered or "not authorized" in lowered
 
 
 def list_databricks_apps(workspace: str, profile: str | None = None) -> list[dict]:
@@ -1474,9 +1493,53 @@ _MODEL_SERVICE_REQUIRED_PREFIX = "system.ai."
 # is the only server-side narrowing that works.
 _MODEL_SERVICE_PARENT_SCHEMA = "schemas/system.ai"
 
-# Supported OSS chat families, matched by name substring. Add an entry to
-# support a new family.
+# Supported OSS chat families for discover_model_services / classify_model_family
+# (the Unity Catalog system.ai.* model-services listing), matched by name
+# substring. Add an entry to support a new family on that path specifically —
+# see _AI_GATEWAY_OSS_FAMILIES below for the separate, broader cohort the
+# AI-Gateway foundation-model serving-endpoints fallback recognizes.
 _OSS_MODEL_FAMILIES = ("kimi-", "glm-", "deepseek-")
+
+# Supported OSS chat families for discover_oss_models's AI-Gateway fallback
+# (serving endpoints on the mlflow/v1/chat/completions route), matched by name
+# substring. Deliberately NOT shared with _OSS_MODEL_FAMILIES above:
+# discover_model_services's own tests (test_oss_allowlist_drops_unsupported_families,
+# test_no_matching_families_reports_sample) assert llama/qwen are NOT
+# recognized on the model-services path, while lukecameron/ucode's
+# fix/oss-serving-endpoints-fallback branch, databricks/unity-gateway#420, and
+# SafetyCulture/experimental#474 all independently confirm this broader cohort
+# is real and reachable on the AI-Gateway route specifically. The two listings
+# expose different things under different ids (see discover_oss_models's
+# docstring), so their supported-family scopes are allowed to differ too.
+_AI_GATEWAY_OSS_FAMILIES = (
+    "kimi-",
+    "glm-",
+    "deepseek-",
+    "inkling",
+    "llama-",
+    "qwen",
+    "gpt-oss-",
+    "gemma-",
+)
+
+# Services that share a family substring with a chat model but cannot back a
+# chat agent (`qwen3-embedding-*` matches the bare "qwen" family). The
+# foundation-models listing doesn't expose api_types, so these have to be
+# excluded by name instead.
+_OSS_NON_CHAT_SUBSTRINGS = ("embedding", "embed", "rerank")
+
+
+def _is_oss_chat_model(model_id: str) -> bool:
+    """True if `model_id` matches an AI-Gateway-fallback OSS chat family.
+
+    Used only by discover_oss_models's serving-endpoints fallback — see
+    _AI_GATEWAY_OSS_FAMILIES for why this is a different, broader cohort than
+    discover_model_services'/classify_model_family's _OSS_MODEL_FAMILIES.
+    """
+    if any(bad in model_id for bad in _OSS_NON_CHAT_SUBSTRINGS):
+        return False
+    return any(family in model_id for family in _AI_GATEWAY_OSS_FAMILIES)
+
 
 # Claude model families ucode buckets, newest tier first. Each maps to a
 # Claude Code family alias (ANTHROPIC_DEFAULT_<FAMILY>_MODEL). Add an entry to
@@ -1506,29 +1569,128 @@ def classify_model_family(model_id: str) -> str | None:
     return None
 
 
-# Per-family token limits (context window + max output tokens). These are a
-# property of the model + its `/ai-gateway/mlflow/v1` route (the gateway rejects
-# requests whose output exceeds the cap), not of any one agent — so every agent
-# that serves OSS models reads this single table and translates it into its own
-# config dialect. Both fields are provided because agents like OpenCode require
-# context and output together. Keyed by family substring; add an entry to bound
-# a new model.
+# Per-family token limits (context window + max output tokens), keyed by model-id
+# substring. The gateway 400s a request whose max_tokens exceeds its cap, and
+# Claude Code has no way to discover a Databricks model's real context window, so
+# both numbers have to come from probing the gateway rather than an API.
+#
+# This table is shared across agents that serve OSS models (each translates limits
+# into its own config dialect). Both fields are required because agents like
+# OpenCode need context and output together on every model.
+#
+# Values are workspace-specific: the same model can have a different cap on a
+# different Databricks account. Every entry below was measured directly against
+# safetyculture-safetyculture-production — do not copy caps from another
+# workspace's ucode fork or PR without reprobing here first (see the glm/qwen/
+# gpt-oss/llama/gemma caveat below).
 _MODEL_TOKEN_LIMITS: dict[str, dict[str, int]] = {
-    # GLM-4.6: 200k context, but the gateway caps output well below the model's
-    # native 128k — pin 25k so requests aren't rejected.
-    "glm": {"context": 200_000, "output": 25_000},
+    # glm and kimi/kimi-k3/inkling: probed against safetyculture-safetyculture-production
+    # twice, independently, by tripping the gateway's max_tokens rejection —
+    # lukecameron/ucode@fix/oss-serving-endpoints-fallback (2026-07-16) and
+    # SafetyCulture/experimental#474 (2026-08-05, GLM) / #478 (2026-08-11, Kimi K3).
+    # Context windows for glm and kimi-k3 come from each endpoint's own description
+    # ("supports a context length of 1M tokens"), not a guess.
+    "kimi-k3": {"context": 1_000_000, "output": 65_536},
+    "kimi": {"context": 128_000, "output": 65_536},
+    "glm": {"context": 1_000_000, "output": 65_536},
+    "inkling": {"context": 128_000, "output": 65_536},
+    # qwen/gpt-oss/llama-4-maverick/gemma: from databricks/unity-gateway#420, which
+    # tested a workspace other than ours. None of these families have been seen on
+    # safetyculture-safetyculture-production as of 2026-09-09 (discover_oss_models
+    # has never returned one) — kept as a same-cohort placeholder so a family isn't
+    # left with no limit at all if one of these models is later added here, but
+    # reprobe before trusting the number if that happens.
+    "qwen": {"context": 262_144, "output": 25_000},
+    "gpt-oss": {"context": 131_072, "output": 25_000},
+    # Keyed on the full name, not `llama`: the Llama 3 endpoints have a 128k
+    # context, so a bare `llama` key would pin 1M on them.
+    "llama-4-maverick": {"context": 1_000_000, "output": 8_192},
+    "gemma": {"context": 131_072, "output": 8_192},
 }
 
 
 def model_token_limits(model_id: str) -> dict[str, int] | None:
     """Return ``{"context": ..., "output": ...}`` limits for ``model_id``, or None.
 
-    Matches by family substring (e.g. any ``*glm*`` id). None means the model
+    Matches by family substring (e.g. any ``*glm*`` id), longest key first so a
+    more specific entry (``kimi-k3``) wins over a shorter one that would otherwise
+    also match (``kimi``) regardless of dict insertion order. None means the model
     has no known limits and the agent should not pin any."""
-    for family, limits in _MODEL_TOKEN_LIMITS.items():
+    for family in sorted(_MODEL_TOKEN_LIMITS, key=len, reverse=True):
         if family in model_id:
-            return dict(limits)
+            return dict(_MODEL_TOKEN_LIMITS[family])
     return None
+
+
+# Models with native image input on the mlflow chat-completions route. Everything
+# else gets images stripped to a text placeholder rather than sent and wasted or
+# rejected. Extend this if another model gains vision (SafetyCulture/experimental#478).
+VISION_FAMILIES: tuple[str, ...] = ("kimi-k3",)
+
+
+def supports_vision(model_id: str) -> bool:
+    return any(family in model_id for family in VISION_FAMILIES)
+
+
+# A context window at or above this earns Claude Code's `[1m]` name suffix.
+_LONG_CONTEXT_TOKENS = 1_000_000
+
+
+def oss_model_name(model: str) -> str:
+    """The name to pin/echo for an OSS model, with `[1m]` when it really is
+    1M-context.
+
+    Used both at launch (`ucode.agents.claude._launch_oss_shim`, to pin
+    ANTHROPIC_DEFAULT_*_MODEL) and per-response (`ucode.agents.claude_oss.
+    server.Handler._messages`, to echo the same suffixed name back in the
+    Anthropic-shaped response's `model` field). Both call sites matter: Claude
+    Code tracks its context-window assumption off the model string it actually
+    receives back in a response, not just the one it was launched with, so a
+    response echoing the bare id silently re-classifies an already-pinned 1M
+    model as "unrecognized" (200k default) on every single turn - the status
+    bar then shows real usage against the wrong ceiling (stuck near/at 100%
+    for a session nowhere near its real limit) while compaction never fires
+    (unrecognized-model window enforcement is passive, not proactive).
+
+    `_maybe_add_1m_suffix` (agents/claude.py) cannot be reused here: it
+    matches `_CLAUDE_MODEL_RE` (`claude-(opus|sonnet)-<version>`), so every
+    OSS id falls through unsuffixed. Drive the decision off the context
+    window `model_token_limits` already records per family rather than a
+    second hand-maintained id list; an id with no known limits makes no claim
+    and stays bare."""
+    if model.endswith("[1m]"):
+        return model
+    limits = model_token_limits(model)
+    if limits and limits["context"] >= _LONG_CONTEXT_TOKENS:
+        return f"{model}[1m]"
+    return model
+
+
+def _digit_runs(model: str) -> tuple[int, ...]:
+    """Every run of digits in `model`, as ints, in order.
+
+    `glm-5-9` -> (5, 9); `kimi-k3` -> (3,); `kimi-k2-7-code` -> (2, 7).
+    Deliberately not `model_version_sort_key` (used elsewhere for cleanly
+    dash-separated versions like `gemini-3-5-flash`): that key only extracts
+    a version from a token that is ENTIRELY digits, so it never sees the `3`
+    in `k3` at all and would rank `kimi-k2-7-code` as newer than `kimi-k3` on
+    this real workspace's actual catalogue — a real regression, not just a
+    hypothetical one."""
+    return tuple(int(run) for run in re.findall(r"\d+", model))
+
+
+def newest(models: list[str], family: str) -> str | None:
+    """Pick the highest-versioned model in `family` from a discovered model list.
+
+    Compares every embedded digit run numerically (see `_digit_runs`), tied
+    broken by the raw string for stability — plain reverse-lexicographic
+    string sort (the original approach, matching
+    SafetyCulture/experimental#474's `dbxclaude.databricks.newest`) ranks
+    `glm-5-9` above `glm-5-10` because `'9' > '1'` as characters."""
+    matches = sorted(
+        (m for m in models if family in m), key=lambda m: (_digit_runs(m), m), reverse=True
+    )
+    return matches[0] if matches else None
 
 
 def _model_service_id(service: dict) -> str | None:
@@ -2847,6 +3009,34 @@ def discover_codex_models(workspace: str, token: str) -> tuple[list[str], str | 
     # and default is e.g. gpt-5-4 rather than the alphabetically-first gpt-5.
     return discover_endpoints_with_api_type(
         workspace, token, "openai/v1/responses", sort_key=model_version_sort_key
+    )
+
+
+def discover_oss_models(workspace: str, token: str) -> tuple[list[str], str | None]:
+    """Discover OSS chat models served as AI Gateway foundation-model endpoints.
+
+    Fallback for workspaces that don't register OSS foundation models as
+    `system.ai.*` UC model-services (see `discover_model_services`): those
+    workspaces expose the same models as regular `databricks-*` serving
+    endpoints instead. Lists every endpoint advertising the
+    `mlflow/v1/chat/completions` dialect, then keeps only the OSS chat families
+    (`_is_oss_chat_model`) — on some workspaces the Claude/Gemini endpoints also
+    advertise that dialect, so the family filter is what separates the OSS
+    cohort from them. Mirrors the AI-Gateway fallback the other families use
+    when the UC model-services listing is empty.
+    """
+    endpoints, reason = discover_endpoints_with_api_type(
+        workspace, token, "mlflow/v1/chat/completions"
+    )
+    if not endpoints:
+        return [], reason
+    oss = [e for e in endpoints if _is_oss_chat_model(e)]
+    if oss:
+        return oss, None
+    sample = ", ".join(endpoints[:5])
+    return [], (
+        "foundation-models exposing `mlflow/v1/chat/completions` matched no OSS "
+        f"chat family (got: {sample})"
     )
 
 

@@ -150,15 +150,33 @@ class TestRenderOverlay:
         overlay, _ = opencode.render_overlay("system.ai.glm-5-2", "tok", _base_urls(), models)
         glm = overlay["provider"]["databricks-oss"]["models"]["system.ai.glm-5-2"]
         # OpenCode's schema requires both context and output on `limit`.
-        assert glm["limit"] == {"context": 200000, "output": 25000}
+        assert glm["limit"] == {"context": 1000000, "output": 65536}
 
-    def test_non_glm_oss_model_has_no_output_cap(self):
-        models = {"oss": ["system.ai.kimi-k2-7-code"]}
+    def test_unknown_oss_family_has_no_output_cap(self):
+        # kimi-k2-7-code now has a known limit (see docs/superpowers/plans/
+        # 2026-09-09-claude-oss-shim.md Task 0) — use a family this table
+        # genuinely has no entry for to test "no known limit".
+        models = {"oss": ["system.ai.made-up-model-xyz"]}
         overlay, _ = opencode.render_overlay(
-            "system.ai.kimi-k2-7-code", "tok", _base_urls(), models
+            "system.ai.made-up-model-xyz", "tok", _base_urls(), models
         )
-        kimi = overlay["provider"]["databricks-oss"]["models"]["system.ai.kimi-k2-7-code"]
-        assert "limit" not in kimi
+        unknown = overlay["provider"]["databricks-oss"]["models"]["system.ai.made-up-model-xyz"]
+        assert "limit" not in unknown
+
+    def test_qwen_gets_token_limits(self):
+        model = "system.ai.qwen35-122b-a10b"
+        overlay, _ = opencode.render_overlay(model, "tok", _base_urls(), {"oss": [model]})
+        qwen = overlay["provider"]["databricks-oss"]["models"][model]
+        assert qwen["limit"] == {"context": 262144, "output": 25000}
+
+    def test_oss_provider_opts_out_of_the_prompt_cache_key(self):
+        # OpenCode stamps `prompt_cache_key` on every `@ai-sdk/openai` request and
+        # the gateway rejects the unknown field. It reads the opt-out from the
+        # provider options only, so a per-model entry would not suppress it.
+        model = "system.ai.qwen35-122b-a10b"
+        overlay, _ = opencode.render_overlay(model, "tok", _base_urls(), {"oss": [model]})
+        assert overlay["provider"]["databricks-oss"]["options"]["setCacheKey"] is False
+        assert "setCacheKey" not in overlay["provider"]["databricks-oss"]["models"][model]
 
     def test_token_in_api_key(self):
         models = {"anthropic": ["claude-sonnet"]}

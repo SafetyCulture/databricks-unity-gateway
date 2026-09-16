@@ -15,7 +15,12 @@ from databricks.sdk import oauth
 
 from ucode.constants import LOCALHOST, LOOPBACK_HOST
 from ucode.databricks import build_auth_token_argv
-from ucode.ui import err_console, normalize_workspace_url, print_warning_err
+from ucode.ui import (
+    err_console,
+    normalize_workspace_url,
+    print_warning_err,
+    reject_non_https_workspace,
+)
 
 DEFAULT_REDIRECT_URL = f"http://{LOCALHOST}:8020"
 # Custom OAuth may need a human to finish browser consent, not just a token fetch.
@@ -123,6 +128,11 @@ def get_custom_client_token(
     """Reuse the SDK's PKCE flow and per-workspace/client token cache."""
     config = create_custom_oauth_config(client_id, scopes, redirect_url)
     workspace = normalize_workspace_url(workspace)
+    # normalize_workspace_url deliberately preserves an explicit http:// for
+    # loopback dev/test workspaces; a real host given as http://... must not
+    # reach OIDC discovery, which drives token refresh/login and would run
+    # entirely over plaintext.
+    reject_non_https_workspace(workspace)
     try:
         endpoints = oauth.get_workspace_endpoints(workspace)
         cache = oauth.TokenCache(

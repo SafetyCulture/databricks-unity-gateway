@@ -385,18 +385,121 @@ def _model_service(model_id: str) -> dict:
 class TestModelTokenLimits:
     def test_glm_is_capped(self):
         assert db_mod.model_token_limits("system.ai.glm-5-2") == {
-            "context": 200_000,
-            "output": 25_000,
+            "context": 1_000_000,
+            "output": 65_536,
         }
 
     def test_glm_matches_any_version(self):
         assert db_mod.model_token_limits("system.ai.glm-4-6-flash") == {
-            "context": 200_000,
-            "output": 25_000,
+            "context": 1_000_000,
+            "output": 65_536,
         }
 
     def test_uncapped_model_returns_none(self):
-        assert db_mod.model_token_limits("system.ai.kimi-k2-7-code") is None
+        # kimi-k2-7-code now has a known limit (see TestModelTokenLimits below /
+        # docs/superpowers/plans/2026-09-09-claude-oss-shim.md Task 0) — use a
+        # family this table genuinely has no entry for for "no known limit".
+        assert db_mod.model_token_limits("system.ai.made-up-model-xyz") is None
+
+    def test_gateway_caps_measured_against_the_workspace(self):
+        # Each `output` is the cap the gateway enforces; a request above it fails
+        # with HTTP 400.
+        assert db_mod.model_token_limits("system.ai.qwen35-122b-a10b")["output"] == 25_000
+        assert db_mod.model_token_limits("system.ai.gpt-oss-120b")["output"] == 25_000
+        assert db_mod.model_token_limits("system.ai.gpt-oss-20b")["output"] == 25_000
+        assert db_mod.model_token_limits("system.ai.llama-4-maverick")["output"] == 8_192
+        assert db_mod.model_token_limits("system.ai.gemma-3-12b")["output"] == 8_192
+
+    def test_llama_3_endpoints_do_not_take_the_maverick_context(self):
+        # A bare `llama` key would pin Maverick's 1M context on the 128k Llama 3
+        # endpoints.
+        assert db_mod.model_token_limits("system.ai.meta-llama-3-3-70b-instruct") is None
+
+    def test_kimi_k3_gets_the_million_token_window(self):
+        # kimi-k3 specifically is 1M context (verified against safetyculture-safetyculture-production
+        # by SafetyCulture/experimental#478, 2026-08-11), distinct from the general "kimi" family
+        # (K2.7 Code, Inkling), which stays at the conservative 128k default.
+        assert db_mod.model_token_limits("databricks-kimi-k3") == {
+            "context": 1_000_000,
+            "output": 65_536,
+        }
+
+    def test_kimi_k2_7_code_keeps_the_family_default(self):
+        assert db_mod.model_token_limits("databricks-kimi-k2-7-code") == {
+            "context": 128_000,
+            "output": 65_536,
+        }
+
+    def test_glm_output_cap_matches_the_live_workspace_measurement(self):
+        # Corrected from PR#420's 25_000/200_000 (measured against a different Databricks
+        # workspace) to the value independently confirmed twice against our own workspace
+        # (SafetyCulture/experimental#474, 2026-08-05: "I confirmed the output cap exactly by
+        # tripping the gateway's rejection").
+        assert db_mod.model_token_limits("databricks-glm-5-2") == {
+            "context": 1_000_000,
+            "output": 65_536,
+        }
+
+    def test_longest_family_key_wins_regardless_of_dict_order(self):
+        # Guards the kimi vs kimi-k3 distinction: a naive first-match-in-iteration-order lookup
+        # would let the shorter "kimi" key mask "kimi-k3" depending on dict insertion order.
+        assert db_mod.model_token_limits("databricks-kimi-k3")["context"] == 1_000_000
+        assert db_mod.model_token_limits("databricks-kimi-k2-7-code")["context"] == 128_000
+
+
+class TestNewest:
+    def test_picks_the_highest_versioned_model_in_a_family(self):
+        models = ["databricks-glm-4-6", "databricks-glm-5-2", "databricks-kimi-k2-7-code"]
+        assert db_mod.newest(models, "glm") == "databricks-glm-5-2"
+
+    def test_returns_none_when_the_family_has_no_match(self):
+        assert db_mod.newest(["databricks-glm-5-2"], "qwen") is None
+
+    def test_sorts_multi_digit_versions_numerically_not_lexicographically(self):
+        # A plain reverse-lexicographic sort ranks "5-9" above "5-10" ('9' >
+        # '1' as characters) - wrong once a family reaches a double-digit
+        # minor version.
+        models = ["databricks-glm-5-9", "databricks-glm-5-10"]
+        assert db_mod.newest(models, "glm") == "databricks-glm-5-10"
+
+    def test_still_prefers_kimi_k3_over_kimi_k2_7_code(self):
+        # Regression guard: `model_version_sort_key` (used elsewhere for
+        # cleanly dash-separated versions like "gemini-3-5-flash") does NOT
+        # extract a version from "k3" - its digit run is embedded after a
+        # letter, not a separate dash token - so naively reusing it here would
+        # rank "kimi-k2-7-code" as newer than "kimi-k3" on this real
+        # workspace's actual catalogue. `newest` must get this right without
+        # that regression.
+        models = ["databricks-kimi-k2-7-code", "databricks-kimi-k3"]
+        assert db_mod.newest(models, "kimi") == "databricks-kimi-k3"
+
+
+class TestSupportsVision:
+    def test_kimi_k3_supports_vision(self):
+        assert db_mod.supports_vision("databricks-kimi-k3") is True
+
+    def test_other_oss_models_do_not(self):
+        assert db_mod.supports_vision("databricks-kimi-k2-7-code") is False
+        assert db_mod.supports_vision("databricks-glm-5-2") is False
+
+
+class TestOssModelName:
+    """Shared by both `ucode.agents.claude._launch_oss_shim` (pins
+    ANTHROPIC_DEFAULT_*_MODEL) and `ucode.agents.claude_oss.server`'s
+    `_messages` (echoes the same name back in every response's `model`
+    field) — both call sites matter, or Claude Code's context-window
+    tracking silently reverts to its 200k "unrecognized model" default on
+    every turn even though the launch-time pin said 1M."""
+
+    def test_a_1m_context_oss_model_gets_the_suffix(self):
+        assert db_mod.oss_model_name("databricks-glm-5-2") == "databricks-glm-5-2[1m]"
+        assert db_mod.oss_model_name("databricks-kimi-k3") == "databricks-kimi-k3[1m]"
+
+    def test_a_smaller_context_oss_model_does_not(self):
+        assert db_mod.oss_model_name("databricks-kimi-k2-7-code") == "databricks-kimi-k2-7-code"
+
+    def test_an_already_suffixed_id_is_not_doubled(self):
+        assert db_mod.oss_model_name("databricks-glm-5-2[1m]") == "databricks-glm-5-2[1m]"
 
 
 class TestDiscoverModelServices:
@@ -1483,6 +1586,82 @@ class TestDiscoverGeminiModels:
 
         assert reason is None
         assert models == ["databricks-gpt-5-2-codex", "databricks-gpt-4-1"]
+
+
+def _mlflow_chat_payload(names, *, api_type="mlflow/v1/chat/completions", v2=True):
+    return {
+        "endpoints": [
+            {
+                "name": name,
+                "config": {
+                    "served_entities": [
+                        {
+                            "foundation_model": {
+                                "ai_gateway_v2_supported": v2,
+                                "api_types": [api_type],
+                            }
+                        }
+                    ]
+                },
+            }
+            for name in names
+        ]
+    }
+
+
+class TestDiscoverOssModels:
+    def test_finds_oss_endpoints_via_foundation_models(self, monkeypatch):
+        # Mirrors a workspace with no system.ai UC model-services: OSS models are
+        # plain databricks-* serving endpoints under the mlflow chat dialect.
+        payload = _mlflow_chat_payload(
+            [
+                "databricks-glm-5-2",
+                "databricks-inkling",
+                "databricks-qwen35-122b-a10b",
+                "databricks-gemma-3-12b",
+            ]
+        )
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        models, reason = db_mod.discover_oss_models(WS, "token")
+
+        assert reason is None
+        assert "databricks-glm-5-2" in models
+        assert set(models) == {
+            "databricks-glm-5-2",
+            "databricks-inkling",
+            "databricks-qwen35-122b-a10b",
+            "databricks-gemma-3-12b",
+        }
+
+    def test_excludes_claude_and_gemini_sharing_the_mlflow_dialect(self, monkeypatch):
+        # On some workspaces every foundation model advertises the mlflow chat
+        # dialect, so the api_type filter alone is too broad — the OSS family
+        # filter must drop Claude/Gemini and keep only the OSS cohort.
+        payload = _mlflow_chat_payload(
+            [
+                "databricks-claude-opus-4-8",
+                "databricks-gemini-2-5-pro",
+                "databricks-glm-5-2",
+                "databricks-qwen3-embedding-0-6b",
+            ]
+        )
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        models, reason = db_mod.discover_oss_models(WS, "token")
+
+        assert reason is None
+        assert models == ["databricks-glm-5-2"]
+
+    def test_reports_reason_when_no_oss_family_matches(self, monkeypatch):
+        payload = _mlflow_chat_payload(["databricks-claude-opus-4-8"])
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        models, reason = db_mod.discover_oss_models(WS, "token")
+
+        assert models == []
+        assert reason is not None
+        assert "no OSS" in reason
 
 
 class TestResolvePatToken:
@@ -3409,6 +3588,32 @@ class TestAllUsersCanUseSchema:
         assert "principal=account%20users" in seen["url"]
 
 
+class TestLooksLikeCliPermissionError:
+    """A short-lived OAuth token expiring reports `401 Unauthorized`, not a
+    permission denial — but the substring check used to treat the bare word
+    "unauthorized" as equivalent to "not authorized"/"403", so an expired
+    token got classified as PermissionDeniedError. `_discover_mcp_source`
+    then silently skips the source instead of surfacing a re-authentication
+    error — the caller never learns their session died."""
+
+    def test_401_unauthorized_is_not_a_permission_error(self):
+        assert db_mod._looks_like_cli_permission_error("Error: 401 Unauthorized") is False
+
+    def test_a_genuine_403_still_is(self):
+        assert db_mod._looks_like_cli_permission_error("Error: 403 Forbidden") is True
+
+    def test_permission_denied_wording_still_is(self):
+        assert db_mod._looks_like_cli_permission_error("permission denied") is True
+        assert db_mod._looks_like_cli_permission_error("insufficient permission") is True
+
+    def test_not_authorized_wording_still_is(self):
+        assert db_mod._looks_like_cli_permission_error("you are not authorized") is True
+
+    def test_empty_stderr_is_not_a_permission_error(self):
+        assert db_mod._looks_like_cli_permission_error(None) is False
+        assert db_mod._looks_like_cli_permission_error("") is False
+
+
 class TestBearerCommand:
     """``DATABRICKS_BEARER_COMMAND`` is the command form of the static
     ``DATABRICKS_BEARER`` hatch, for callers whose bearer expires and has to be
@@ -3511,11 +3716,38 @@ class TestBearerCommand:
             get_databricks_token(WS)
         assert not marker.exists()
 
+    def test_does_not_leak_command_arguments_when_the_command_exits_non_zero(
+        self, tmp_path, monkeypatch
+    ):
+        # A broker is commonly invoked with a credential argument (e.g.
+        # `broker --api-key ...`). The command already fails closed for a bad
+        # exit, but the error text itself must not echo that argument back
+        # into stderr/CI logs.
+        broker = self._broker(tmp_path, "exit 7")
+        self._env(tmp_path, monkeypatch, f"{broker} --api-key super-secret-value")
+
+        with pytest.raises(RuntimeError, match="exited 7") as excinfo:
+            get_databricks_token(WS)
+        assert "super-secret-value" not in str(excinfo.value)
+
     def test_reports_an_unrunnable_command(self, tmp_path, monkeypatch):
         self._env(tmp_path, monkeypatch, str(tmp_path / "does-not-exist"))
 
         with pytest.raises(RuntimeError, match="could not be run"):
             get_databricks_token(WS)
+
+    def test_does_not_leak_command_arguments_when_the_command_cannot_run(
+        self, tmp_path, monkeypatch
+    ):
+        self._env(
+            tmp_path,
+            monkeypatch,
+            f"{tmp_path / 'does-not-exist'} --api-key super-secret-value",
+        )
+
+        with pytest.raises(RuntimeError, match="could not be run") as excinfo:
+            get_databricks_token(WS)
+        assert "super-secret-value" not in str(excinfo.value)
 
     def test_static_bearer_still_wins(self, tmp_path, monkeypatch):
         broker = self._broker(tmp_path, 'echo "brokered-token"')

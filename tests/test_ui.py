@@ -224,6 +224,26 @@ class TestNormalizeWorkspaceUrl:
             normalize_workspace_url("   ")
 
 
+class TestRejectNonHttpsWorkspace:
+    """`normalize_workspace_url` deliberately preserves an explicit `http://`
+    (test_preserves_http, above) for loopback dev/test use. Callers that then
+    send a real bearer token to the normalized URL need a separate guard, so
+    an explicit `--workspace http://some-real-host` can't ship a credential
+    over plaintext — narrower than rejecting http:// outright, which would
+    break the loopback case."""
+
+    def test_accepts_https(self):
+        ui_mod.reject_non_https_workspace("https://example.cloud.databricks.com")
+
+    def test_accepts_loopback_http(self):
+        ui_mod.reject_non_https_workspace("http://127.0.0.1:8080")
+        ui_mod.reject_non_https_workspace("http://localhost:8080")
+
+    def test_rejects_a_real_host_over_http(self):
+        with pytest.raises(RuntimeError, match="non-HTTPS"):
+            ui_mod.reject_non_https_workspace("http://example.cloud.databricks.com")
+
+
 class TestScrollHint:
     """A long picker list scrolls, but questionary doesn't say so — the pickers add the hint."""
 

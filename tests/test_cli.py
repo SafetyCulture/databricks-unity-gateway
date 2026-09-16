@@ -1397,6 +1397,51 @@ class TestStatus:
         assert result.exit_code == 0, result.output
         assert "Workspace-managed config" not in result.output
 
+    def test_shows_oss_shim_label_when_claude_fallback_is_active(self):
+        """A standalone `ug status` run (a separate invocation, after an
+        earlier fallback launch) must still be able to tell the fallback
+        happened — get_provider_service alone can't show this, since the OSS
+        shim isn't a provider_services entry."""
+        state = {
+            **MINIMAL_STATE,
+            "claude_models": {},
+            "claude_oss_fallback": True,
+            "oss_models": ["databricks-glm-5-2", "databricks-kimi-k3"],
+        }
+        with patch("ucode.cli.load_state", return_value=state):
+            result = runner.invoke(app, ["status"])
+
+        assert result.exit_code == 0, result.output
+        output = _strip_ansi(result.output)
+        assert "Provider: Databricks OSS shim (databricks-glm-5-2, databricks-kimi-k3)" in output
+
+    def test_hides_oss_shim_label_when_fallback_not_active(self):
+        with patch("ucode.cli.load_state", return_value=MINIMAL_STATE):
+            result = runner.invoke(app, ["status"])
+
+        assert result.exit_code == 0, result.output
+        assert "Databricks OSS shim" not in result.output
+
+    def test_model_provider_service_still_wins_over_oss_shim_label(self):
+        """provider_services and claude_oss_fallback aren't expected to coexist
+        in practice (write_tool_config's stale-flag clearing drops
+        claude_oss_fallback whenever a provider is set), but if state ever has
+        both, the existing Model Provider Service line must still win rather
+        than being silently replaced."""
+        state = {
+            **MINIMAL_STATE,
+            "provider_services": {"claude": "system.ai.anthropic"},
+            "claude_oss_fallback": True,
+            "oss_models": ["databricks-glm-5-2"],
+        }
+        with patch("ucode.cli.load_state", return_value=state):
+            result = runner.invoke(app, ["status"])
+
+        assert result.exit_code == 0, result.output
+        output = _strip_ansi(result.output)
+        assert "Model Provider Service: system.ai.anthropic" in output
+        assert "Databricks OSS shim" not in output
+
 
 class TestConfigureSkillsCommand:
     def test_mcp_flag_dispatches_location_set(self):
@@ -2011,7 +2056,7 @@ class TestAutoConfigureOnFirstRun:
             result = runner.invoke(app, ["claude"])
         assert result.exit_code == 0, result.output
         mock_bootstrap.assert_called_once_with("claude")
-        mock_auto.assert_called_once_with("claude")
+        mock_auto.assert_called_once_with("claude", no_oss_fallback=False)
 
     def test_triggers_when_tool_not_in_available_tools(self):
         """Auto-configure runs when workspace exists but the tool wasn't configured."""
@@ -2036,7 +2081,7 @@ class TestAutoConfigureOnFirstRun:
             result = runner.invoke(app, ["claude"])
         assert result.exit_code == 0, result.output
         mock_bootstrap.assert_called_once_with("claude")
-        mock_auto.assert_called_once_with("claude")
+        mock_auto.assert_called_once_with("claude", no_oss_fallback=False)
 
     def test_skipped_when_already_configured(self):
         """Auto-configure is skipped when workspace and tool are already set up."""
@@ -2973,6 +3018,12 @@ class TestConfigureSharedStateUsePat:
         monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: ({}, None))
         monkeypatch.setattr(cli_mod, "discover_gemini_models", lambda w, t: ([], None))
         monkeypatch.setattr(cli_mod, "discover_codex_models", lambda w, t: ([], None))
+        # discover_oss_models falls back to its own _http_get_json calls when
+        # discover_model_services returns no oss models (see discover_oss_models
+        # in databricks.py) — stub it directly so it doesn't compete with this
+        # class's own _http_get_json monkeypatch, which several tests below feed
+        # a response iterator sized for probe_unity_gateway_capabilities alone.
+        monkeypatch.setattr(cli_mod, "discover_oss_models", lambda w, t: ([], None))
         monkeypatch.setattr(cli_mod, "build_shared_base_urls", lambda w: {})
         return cli_mod, logins, ensures, saved
 
@@ -3382,6 +3433,249 @@ class TestConfigureSharedStateMcpCleanup:
         assert purge_calls == []
 
 
+class TestConfigureSharedStateOssFallback:
+    """`claude_oss_fallback` is the one-line policy connecting Task 0's
+    `discover_oss_models` to Task 5's `_launch_oss_shim`: a workspace with no
+    Claude models but some OSS chat models (GLM, Kimi, ...) should configure
+    for the translation shim instead of leaving `claude_models` empty.
+
+    `want_oss` includes "claude", so a `tools=["claude"]`-only call — which is
+    what every real `ucode claude` launch makes — does discover OSS models and
+    compute the flag (pinned by
+    `test_a_lone_claude_configure_discovers_oss_models_too`). Several cases
+    below pass no `tools` filter at all (fetch_all) simply because the flag's
+    condition doesn't depend on which tool asked.
+
+    `want_oss` does NOT include "copilot"/"pi" even though `want_claude` does,
+    so those tools must leave the flag untouched rather than recompute it from
+    an `oss_models` they never fetched.
+    """
+
+    WS = "https://example.cloud.databricks.com"
+
+    @staticmethod
+    def _stub_external_deps(monkeypatch):
+        import ucode.cli as cli_mod
+
+        monkeypatch.setattr(cli_mod, "normalize_workspace_url", lambda w: w)
+        monkeypatch.setattr(cli_mod, "run_databricks_login", lambda w, p: None)
+        monkeypatch.setattr(cli_mod, "ensure_databricks_auth", lambda w, p=None: None)
+        monkeypatch.setattr(cli_mod, "find_profile_name_for_host", lambda w: None)
+        monkeypatch.setattr(cli_mod, "get_databricks_token", lambda w, p: "token")
+        monkeypatch.setattr(
+            cli_mod, "probe_unity_gateway_capabilities", lambda w, t: MODEL_SERVICE_PROBE
+        )
+        monkeypatch.setattr(cli_mod, "discover_model_services", lambda w, t: ({}, [], [], [], None))
+        monkeypatch.setattr(cli_mod, "discover_gemini_models", lambda w, t: ([], None))
+        monkeypatch.setattr(cli_mod, "discover_codex_models", lambda w, t: ([], None))
+        monkeypatch.setattr(cli_mod, "build_shared_base_urls", lambda w: {})
+        monkeypatch.setattr(cli_mod, "load_state", lambda: {})
+
+    def test_sets_oss_fallback_when_no_claude_models_but_oss_models_exist(self, monkeypatch):
+        import ucode.cli as cli_mod
+
+        self._stub_external_deps(monkeypatch)
+        monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: ({}, None))
+        monkeypatch.setattr(
+            cli_mod, "discover_oss_models", lambda w, t: (["databricks-glm-5-2"], None)
+        )
+
+        state = cli_mod.configure_shared_state(self.WS)
+
+        assert state["claude_oss_fallback"] is True
+
+    def test_does_not_set_oss_fallback_when_claude_models_exist(self, monkeypatch):
+        import ucode.cli as cli_mod
+
+        self._stub_external_deps(monkeypatch)
+        monkeypatch.setattr(
+            cli_mod, "discover_claude_models", lambda w, t: ({"opus": "claude-opus-4-8"}, None)
+        )
+        monkeypatch.setattr(
+            cli_mod, "discover_oss_models", lambda w, t: (["databricks-glm-5-2"], None)
+        )
+
+        state = cli_mod.configure_shared_state(self.WS)
+
+        assert state.get("claude_oss_fallback") is not True
+
+    def test_does_not_set_oss_fallback_when_no_oss_models_either(self, monkeypatch):
+        import ucode.cli as cli_mod
+
+        self._stub_external_deps(monkeypatch)
+        monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: ({}, None))
+        monkeypatch.setattr(cli_mod, "discover_oss_models", lambda w, t: ([], "no models"))
+
+        state = cli_mod.configure_shared_state(self.WS)
+
+        assert state.get("claude_oss_fallback") is not True
+
+    def test_a_lone_claude_configure_discovers_oss_models_too(self, monkeypatch):
+        """Every real `ucode claude` invocation configures with `tools=["claude"]`
+        only (see `_auto_configure_tool`/`_launch_tool`) — `want_oss` must fire for
+        that case too, or `oss_models`/`claude_oss_fallback` could never be
+        populated via the actual command a user runs."""
+        import ucode.cli as cli_mod
+
+        self._stub_external_deps(monkeypatch)
+        monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: ({}, None))
+        monkeypatch.setattr(
+            cli_mod, "discover_oss_models", lambda w, t: (["databricks-glm-5-2"], None)
+        )
+
+        state = cli_mod.configure_shared_state(self.WS, tools=["claude"])
+
+        assert state["oss_models"] == ["databricks-glm-5-2"]
+        assert state["claude_oss_fallback"] is True
+
+    def test_no_oss_fallback_flag_forces_the_flag_off_even_with_oss_models(self, monkeypatch):
+        """`--no-oss-fallback` is the escape hatch for a caller (e.g. a script
+        pinned to a specific Claude version) that wants the normal "no models
+        available" error instead of a silent launch against the OSS shim. It
+        must win over the exact condition that otherwise sets
+        `claude_oss_fallback`: no Claude models, but some OSS models."""
+        import ucode.cli as cli_mod
+
+        self._stub_external_deps(monkeypatch)
+        monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: ({}, None))
+        monkeypatch.setattr(
+            cli_mod, "discover_oss_models", lambda w, t: (["databricks-glm-5-2"], None)
+        )
+
+        state = cli_mod.configure_shared_state(self.WS, tools=["claude"], no_oss_fallback=True)
+
+        assert state.get("claude_oss_fallback") is not True
+
+    def _stub_with_persistence(self, monkeypatch, claude_models, oss_models, persisted=None):
+        """As `_stub_external_deps`, but with an in-memory store standing in for
+        the state file (the module-level `no_state_writes` fixture Mocks out the
+        real `save_state`), so a sequence of calls sees each other's writes the
+        way consecutive `ug` commands do. Returns the store."""
+        import ucode.cli as cli_mod
+
+        store: dict = {} if persisted is None else persisted
+
+        def fake_save(state):
+            store.clear()
+            store.update(json.loads(json.dumps(state)))
+
+        self._stub_external_deps(monkeypatch)
+        monkeypatch.setattr(cli_mod, "load_state", lambda: json.loads(json.dumps(store)))
+        monkeypatch.setattr(cli_mod, "save_state", fake_save)
+        monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: (claude_models, None))
+        monkeypatch.setattr(cli_mod, "discover_oss_models", lambda w, t: (oss_models, None))
+        return store
+
+    def test_a_copilot_configure_then_skip_preflight_keeps_the_fallback(self, monkeypatch):
+        """`want_claude` fires for copilot/pi but `want_oss` does not, so the flag
+        was recomputed from an `oss_models` that was never fetched and reset to
+        False. That normally self-corrects on the next real `ug claude` (which
+        re-runs full discovery), but `--skip-preflight` returns from
+        `configure_shared_state` before the recomputation block — so the False
+        sticks, and `resolve_launch_model` rejects the launch with "No models
+        available for claude" on a workspace where the shim would have worked."""
+        import ucode.cli as cli_mod
+        from ucode.agents import resolve_launch_model
+
+        self._stub_with_persistence(monkeypatch, {}, ["databricks-glm-5-2"])
+
+        # 1. A real `ug claude`: no Claude models, some OSS models.
+        state = cli_mod.configure_shared_state(self.WS, tools=["claude"])
+        assert state["claude_oss_fallback"] is True
+
+        # 2. An intervening `ug copilot`, which never discovers OSS models.
+        state = cli_mod.configure_shared_state(self.WS, tools=["copilot"])
+        assert state.get("claude_oss_fallback") is True
+
+        # 3. `ug claude --skip-preflight`, which recomputes nothing at all.
+        state = cli_mod.configure_shared_state(self.WS, tools=["claude"], skip_preflight=True)
+        assert state.get("claude_oss_fallback") is True
+
+        # And the flag is what stops the launch being rejected outright.
+        resolve_launch_model("claude", state, None)
+
+    def test_a_pi_configure_also_leaves_the_fallback_alone(self, monkeypatch):
+        import ucode.cli as cli_mod
+
+        self._stub_with_persistence(monkeypatch, {}, ["databricks-glm-5-2"])
+        cli_mod.configure_shared_state(self.WS, tools=["claude"])
+
+        state = cli_mod.configure_shared_state(self.WS, tools=["pi"])
+
+        assert state.get("claude_oss_fallback") is True
+
+    def test_a_copilot_configure_does_not_invent_a_fallback(self, monkeypatch):
+        """Leaving the flag alone must not mean setting it: a workspace that
+        never had one must not acquire one from a tool that discovered nothing."""
+        import ucode.cli as cli_mod
+
+        self._stub_with_persistence(monkeypatch, {}, [])
+
+        state = cli_mod.configure_shared_state(self.WS, tools=["copilot"])
+
+        assert state.get("claude_oss_fallback") is not True
+
+    def test_a_real_claude_configure_still_clears_a_stale_fallback(self, monkeypatch):
+        """The other half of the rule: once the workspace does have Claude
+        models, a `ug claude` configure — which fetches both lists — must drop
+        the flag, or the shim would keep being preferred over real Claude."""
+        import ucode.cli as cli_mod
+
+        store = self._stub_with_persistence(monkeypatch, {}, ["databricks-glm-5-2"])
+        assert cli_mod.configure_shared_state(self.WS, tools=["claude"])["claude_oss_fallback"]
+
+        self._stub_with_persistence(
+            monkeypatch,
+            {"opus": "databricks-claude-opus-4-8"},
+            ["databricks-glm-5-2"],
+            persisted=store,
+        )
+        state = cli_mod.configure_shared_state(self.WS, tools=["claude"])
+
+        assert state.get("claude_oss_fallback") is not True
+
+
+class TestProviderSummary:
+    """`_provider_summary` backs the 'Provider: ...' line in the Configuration
+    Complete panel (`configure_workspace_command`, `_auto_configure_tool`)."""
+
+    def test_databricks_when_no_provider_service_configured(self):
+        assert cli_mod._provider_summary("claude", {}) == "Databricks"
+
+    def test_anthropic_when_claude_routes_through_a_provider_service(self):
+        state = {"provider_services": {"claude": "system.ai.anthropic"}}
+        assert cli_mod._provider_summary("claude", state) == "Anthropic"
+
+    def test_openai_when_codex_routes_through_a_provider_service(self):
+        state = {"provider_services": {"codex": "system.ai.openai"}}
+        assert cli_mod._provider_summary("codex", state) == "OpenAI"
+
+    def test_oss_shim_names_the_newest_glm_and_kimi_models_when_fallback_active(self):
+        state = {
+            "claude_oss_fallback": True,
+            "oss_models": [
+                "databricks-glm-4-6",
+                "databricks-glm-5-2",
+                "databricks-kimi-k2",
+                "databricks-kimi-k3",
+            ],
+        }
+        assert (
+            cli_mod._provider_summary("claude", state)
+            == "Databricks OSS shim (databricks-glm-5-2, databricks-kimi-k3)"
+        )
+
+    def test_oss_shim_falls_back_to_bare_label_when_no_matching_models_are_named(self):
+        state = {"claude_oss_fallback": True, "oss_models": []}
+        assert cli_mod._provider_summary("claude", state) == "Databricks OSS shim"
+
+    def test_oss_shim_branch_does_not_apply_to_other_tools(self):
+        # claude_oss_fallback is claude-only; another tool with the key somehow
+        # set (e.g. stale state) must not be relabeled by it.
+        state = {"claude_oss_fallback": True, "oss_models": ["databricks-glm-5-2"]}
+        assert cli_mod._provider_summary("codex", state) == "Databricks"
+
+
 class TestConfigureSharedStateSkipDiscovery:
     """With skip_model_discovery (provider mode), the heavy family discovery is
     skipped; only a single web-search model is fetched, and existing model lists
@@ -3539,6 +3833,153 @@ class TestSkipPreflightFlag:
             result = runner.invoke(app, [tool])
         assert result.exit_code == 0, result.output
         assert cfg.call_args.kwargs["skip_preflight"] is False
+
+
+class TestNoOssFallbackFlag:
+    """`--no-oss-fallback` on `ug claude` threads through _launch_tool to
+    configure_shared_state as no_oss_fallback — mirrors --skip-preflight's
+    threading in TestSkipPreflightFlag above, plus the first-run cold-start
+    path through `_auto_configure_tool` (see its own docstring for why that
+    second call site also needs the flag, not just the relaunch one)."""
+
+    @staticmethod
+    def _relaunch_patches(cfg):
+        return [
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli._auto_configure_tool"),
+            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.configure_shared_state", cfg),
+            patch(
+                "ucode.cli.resolve_launch_model",
+                return_value=(MINIMAL_STATE, "databricks-claude-sonnet-4"),
+            ),
+            patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
+            patch("ucode.cli.launch_agent"),
+        ]
+
+    def test_flag_reaches_configure_shared_state_on_relaunch(self):
+        """MINIMAL_STATE already has claude in available_tools, so this is the
+        relaunch path (needs_auto_configure is False): _launch_tool's own
+        configure_shared_state call is the one under test."""
+        cfg = MagicMock(return_value=MINIMAL_STATE)
+        with contextlib.ExitStack() as stack:
+            for p in self._relaunch_patches(cfg):
+                stack.enter_context(p)
+            result = runner.invoke(app, ["claude", "--no-oss-fallback"])
+        assert result.exit_code == 0, result.output
+        assert cfg.call_args.kwargs["no_oss_fallback"] is True
+
+    def test_absent_flag_defaults_false_on_relaunch(self):
+        cfg = MagicMock(return_value=MINIMAL_STATE)
+        with contextlib.ExitStack() as stack:
+            for p in self._relaunch_patches(cfg):
+                stack.enter_context(p)
+            result = runner.invoke(app, ["claude"])
+        assert result.exit_code == 0, result.output
+        assert cfg.call_args.kwargs["no_oss_fallback"] is False
+
+    def test_flag_reaches_auto_configure_tool_on_first_run(self):
+        """An empty state (no prior `ug configure`) takes the cold-start
+        needs_auto_configure branch, which must forward the flag too — without
+        this, a first-run `ug claude --no-oss-fallback` would silently
+        configure the OSS shim in _auto_configure_tool and only error on the
+        launch call that follows, instead of failing cleanly up front."""
+        cfg = MagicMock(return_value=MINIMAL_STATE)
+        auto_configure = MagicMock(return_value=None)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch("ucode.cli.ensure_bootstrap_dependencies"))
+            stack.enter_context(patch("ucode.cli.load_state", return_value={}))
+            stack.enter_context(patch("ucode.cli._auto_configure_tool", auto_configure))
+            stack.enter_context(
+                patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE)
+            )
+            stack.enter_context(patch("ucode.cli.configure_shared_state", cfg))
+            stack.enter_context(
+                patch(
+                    "ucode.cli.resolve_launch_model",
+                    return_value=(MINIMAL_STATE, "databricks-claude-sonnet-4"),
+                )
+            )
+            stack.enter_context(patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE))
+            stack.enter_context(
+                patch("ucode.cli._fetch_managed_config", return_value=(None, False))
+            )
+            stack.enter_context(patch("ucode.cli.launch_agent"))
+            result = runner.invoke(app, ["claude", "--no-oss-fallback"])
+        assert result.exit_code == 0, result.output
+        auto_configure.assert_called_once_with("claude", no_oss_fallback=True)
+
+
+class TestClaudeOssFallbackLaunchGating:
+    """`claude_oss_fallback=True` means no Claude models but some OSS models —
+    `ucode claude` must launch against the OSS shim instead of being rejected
+    by one of the "does claude have a model" gates that only ever looked at
+    `claude_models`: `resolve_launch_model` and `configure_tool`'s claude
+    branch (both hit on every `ucode claude` relaunch, via `_launch_tool`),
+    and `check_gateway_endpoint`/`skip_validation` (hit on first-run/explicit
+    configure, via `_auto_configure_tool`/`configure_single_tool`). These
+    exercise the real (unmocked) gates end to end, standing in for Task 5's
+    already-covered `_launch_oss_shim` internals with a stub."""
+
+    @staticmethod
+    def _state():
+        return {
+            **MINIMAL_STATE,
+            "claude_models": {},
+            "oss_models": ["databricks-glm-5-2", "databricks-kimi-k3"],
+            "claude_oss_fallback": True,
+            "available_tools": ["claude"],
+        }
+
+    def test_relaunch_reaches_the_oss_shim_dispatch_without_being_rejected(self, monkeypatch):
+        """`_launch_tool` (the path every `ucode claude` relaunch takes): real
+        `resolve_launch_model` and real `configure_tool` must not raise before
+        `claude.launch()` dispatches to `_launch_oss_shim`."""
+        import ucode.agents.claude as claude_mod
+
+        state = self._state()
+        oss_shim_calls: list = []
+        # write_tool_config is Task 4/5's real config writer (real file I/O) —
+        # stubbed here as identity so `configure_tool`'s claude-branch guard
+        # (the gate under test) still runs for real, without touching disk.
+        monkeypatch.setattr(claude_mod, "write_tool_config", lambda s, *a, **k: s)
+        monkeypatch.setattr(
+            claude_mod,
+            "_launch_oss_shim",
+            lambda s, binary, tool_args: oss_shim_calls.append(s),
+        )
+
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli._auto_configure_tool") as mock_auto,
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.ensure_provider_state", return_value=state),
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
+        ):
+            result = runner.invoke(app, ["claude"])
+
+        assert result.exit_code == 0, result.output
+        mock_auto.assert_not_called()
+        assert len(oss_shim_calls) == 1
+
+    def test_first_run_configure_gates_treat_oss_fallback_as_usable(self):
+        """`_auto_configure_tool` (the cold-start path, e.g. a bare `ucode claude`
+        with no prior configure): real `check_gateway_endpoint` must consider
+        claude "available" (used by `configure_single_tool`, which
+        `_auto_configure_tool` and the explicit `ucode configure` flow both
+        call), and real `skip_validation` must skip the live probe (there is
+        nothing listening — the shim only starts at launch, so `validate_tool`
+        would otherwise hang or fail against the real Databricks gateway)."""
+        import ucode.agents as agents_mod
+        from ucode.agents import claude as claude_mod
+
+        state = self._state()
+
+        assert agents_mod.check_gateway_endpoint(state, "claude") is True
+        assert claude_mod.skip_validation(state) is True
 
 
 class TestRejectDisabledAgent:
@@ -4026,3 +4467,38 @@ class TestStdioProtocolLaunch:
             assert sys.stdout is sys.stderr
         finally:
             sys.stdout = real_stdout
+
+
+class TestRunClaudeOssProbe:
+    def _fail_if_called(self, *_a, **_k):
+        raise AssertionError("must not reach auth/discovery for a rejected workspace")
+
+    def test_rejects_an_explicit_non_https_workspace_before_any_auth(self, monkeypatch, capsys):
+        # normalize_workspace_url preserves an explicit http:// (loopback
+        # dev/test workspaces rely on this), so a real host given as
+        # http://... would otherwise reach ensure_databricks_auth and mint
+        # and send a real bearer token over plaintext.
+        monkeypatch.setattr(cli_mod, "load_state", lambda: {})
+        monkeypatch.setattr(cli_mod, "ensure_databricks_auth", self._fail_if_called)
+        monkeypatch.setattr(cli_mod, "get_databricks_token", self._fail_if_called)
+        monkeypatch.setattr(cli_mod, "discover_oss_models", self._fail_if_called)
+
+        code = cli_mod._run_claude_oss_probe("http://example.cloud.databricks.com", None)
+
+        assert code == 1
+        assert "non-HTTPS" in capsys.readouterr().err
+
+    def test_accepts_a_loopback_http_workspace(self, monkeypatch, capsys):
+        monkeypatch.setattr(cli_mod, "load_state", lambda: {})
+        monkeypatch.setattr(cli_mod, "ensure_databricks_auth", lambda *a, **k: None)
+        monkeypatch.setattr(cli_mod, "get_databricks_token", lambda *a, **k: "tok")
+        monkeypatch.setattr(
+            cli_mod, "discover_oss_models", lambda *a, **k: (["databricks-glm-5-2"], None)
+        )
+        # run_probe is imported inside the function body (lazy import), so it
+        # must be patched at its source module, not on cli_mod.
+        monkeypatch.setattr("ucode.agents.claude_oss.probe.run_probe", lambda *a, **k: 0)
+
+        code = cli_mod._run_claude_oss_probe("http://127.0.0.1:8080", None)
+
+        assert code == 0

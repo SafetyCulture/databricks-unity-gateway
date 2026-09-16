@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import cast
 
 from ucode import gateway_proxy
+from ucode.agents.claude_oss.server import ModelRouter, make_server
 from ucode.config_io import (
     APP_DIR,
     ToolSpec,
@@ -36,6 +37,8 @@ from ucode.databricks import (
     build_auth_shell_command,
     build_tool_base_url,
     get_databricks_token,
+    newest,
+    oss_model_name,
     ug_binary,
 )
 from ucode.launcher import exec_or_spawn
@@ -201,6 +204,12 @@ MAXIMUM_MLFLOW_VERSION = (3, 12)
 # launches — normal launches keep loading user settings (hooks/permissions) as before.
 _RELAYED_SETTING_SOURCES = "project,local"
 
+# Managed-file fingerprint scopes recorded when the OS-managed mirror is deliberately NOT written.
+# Distinct values so `ucode status` can name which launch mode left it unmirrored (see
+# `managed_files.managed_file_status`) rather than claiming the file mirrors ucode's config.
+RELAY_MANAGED_SCOPE = "relay-compatible"
+OSS_SHIM_MANAGED_SCOPE = "oss-shim-compatible"
+
 
 def configured_paths(state: dict) -> list[str]:
     """The Claude config file ug writes; the OS-managed file is added by the dispatcher."""
@@ -238,7 +247,9 @@ def managed_settings_are_current(state: dict) -> bool:
     if path is None:
         return True
     if state.get("claude_relayed"):
-        required_scope = "relay-compatible"
+        required_scope = RELAY_MANAGED_SCOPE
+    elif state.get("claude_oss_fallback"):
+        required_scope = OSS_SHIM_MANAGED_SCOPE
     elif managed_writes_allowed():
         required_scope = "managed"
     else:
@@ -271,7 +282,19 @@ def revert_managed_settings() -> str:
 
 
 def _managed_relayed_conflicts(path: Path) -> list[str]:
-    """Return managed settings that would override Claude subscription relay auth."""
+    """Return managed settings that would override Claude subscription relay auth
+    or the OSS shim's loopback (both are loopback-server-backed launch modes with
+    the same class of managed-settings risk; shared by both callers below).
+
+    A managed `env.ANTHROPIC_BASE_URL` that already points at a loopback address
+    is not flagged: skipping the managed-file write for these modes (see
+    `_reconcile_managed_settings`) means the only way such a value gets there is
+    an earlier relayed/OSS-shim session's own (now-stale, harmless) URL, not an
+    externally significant one — the exact scenario the managed-write skip is
+    designed to leave behind without incident. `apiKeyHelper` and
+    `ANTHROPIC_CUSTOM_HEADERS` have no equivalent "obviously ours" shape, so any
+    non-empty value there is still treated as a conflict.
+    """
     text = read_managed_file(path)
     if text is None:
         return []
@@ -287,7 +310,14 @@ def _managed_relayed_conflicts(path: Path) -> list[str]:
         conflicts.append("apiKeyHelper")
     env = settings.get("env")
     if isinstance(env, dict):
-        if env.get("ANTHROPIC_BASE_URL"):
+        base_url = env.get("ANTHROPIC_BASE_URL")
+        # The managed file is admin-authored, external input — a number or
+        # object here must be treated as a conflict, not crash `.startswith`
+        # with an AttributeError that escapes this function's RuntimeError
+        # contract.
+        if base_url and not (
+            isinstance(base_url, str) and base_url.startswith(f"http://{LOOPBACK_HOST}:")
+        ):
             conflicts.append("env.ANTHROPIC_BASE_URL")
         if env.get("ANTHROPIC_CUSTOM_HEADERS"):
             conflicts.append("env.ANTHROPIC_CUSTOM_HEADERS")
@@ -340,6 +370,7 @@ def render_overlay(
     custom_model: str | None = None,
     parent_schema: str | None = None,
     static_models: list[str] | None = None,
+    oss_shim_base_url: str | None = None,
 ) -> tuple[dict, list[list[str]]]:
     """Return (overlay, managed_key_paths) for Claude settings.json.
 
@@ -360,11 +391,22 @@ def render_overlay(
     `Authorization` credential, so no `apiKeyHelper` is written (it would outrank
     the subscription OAuth). The Databricks credential rides in the
     `X-Databricks-AI-Gateway-Token` swap header, injected per request by a local
-    refresh proxy at `relayed_base_url` — not written here."""
+    refresh proxy at `relayed_base_url` — not written here.
+
+    When `oss_shim_base_url` is set, the workspace has no Claude models but does
+    have OSS chat models (GLM, Kimi, ...) — `ucode.agents.claude_oss` is running
+    a local Anthropic<->OpenAI translation shim there (see `_launch_oss_shim`).
+    Like `relayed`, no `apiKeyHelper` is written: the shim authenticates to
+    Databricks with its own token and discards whatever Claude Code sends, so a
+    gateway apiKeyHelper here would be pointed at nothing. `provider_models`
+    carries the OSS ids to pin per Claude Code tier, same mechanism a
+    Bedrock-backed Model Provider Service already uses."""
     if relayed:
         if not relayed_base_url:
             raise RuntimeError("Relayed launch requires a proxy base URL.")
         base_url = relayed_base_url
+    elif oss_shim_base_url:
+        base_url = oss_shim_base_url
     else:
         base_url = build_tool_base_url("claude", workspace)
     # ANTHROPIC_CUSTOM_HEADERS is parsed as `key: value` pairs separated by
@@ -410,7 +452,7 @@ def render_overlay(
     # A Bedrock-backed provider needs its provider-side ids pinned verbatim
     # (Claude Code's canonical names aren't routable there). These come from the
     # service's targets, already de-duped to one id per family upstream.
-    elif provider and provider_models:
+    elif provider_models and (provider or oss_shim_base_url):
         if provider_models.get("opus"):
             env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = provider_models["opus"]
         if provider_models.get("sonnet"):
@@ -436,7 +478,7 @@ def render_overlay(
     # Relayed omits apiKeyHelper so Claude Code's subscription OAuth stays the
     # Authorization credential; every other path uses it as the gateway auth.
     overlay: dict = {"env": env}
-    if relayed:
+    if relayed or oss_shim_base_url:
         keys = [["env", k] for k in env]
     else:
         if custom_oauth:
@@ -692,6 +734,7 @@ def write_tool_config(
     custom_model: str | None = None,
     coding_agent_config_defaults: dict[str, str] | None = None,
     parent_schema: str | None = None,
+    oss_shim_base_url: str | None = None,
 ) -> dict:
     # Back up only a file that predates ucode's management of the tool. A
     # re-configure would otherwise snapshot ucode's own generated file, and
@@ -718,6 +761,7 @@ def write_tool_config(
         custom_model=custom_model,
         parent_schema=parent_schema,
         static_models=state.get("claude_static_models"),
+        oss_shim_base_url=oss_shim_base_url,
     )
     tracing_env_vars = tracing_env(state, "claude")
     stop_hook_command = claude_tracing_stop_hook_command() if tracing_env_vars else None
@@ -784,9 +828,15 @@ def write_tool_config(
         merged["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY] = _merge_anthropic_custom_headers(
             existing_custom_headers, overlay_custom_headers
         )
-        # Drop any apiKeyHelper a prior non-relayed launch left in the file; relayed
-        # must not carry one (it would outrank the subscription OAuth).
-        if relayed:
+        # Drop any apiKeyHelper an earlier launch left in the file. render_overlay
+        # omits it on both credential-less paths, but deep_merge_dict keeps keys the
+        # file already has. Relayed must not carry one (it would outrank the
+        # subscription OAuth). The OSS shim must not either, and always finds one:
+        # the pre-launch `configure_tool` write runs before the shim's port exists,
+        # so it passes oss_shim_base_url=None and writes a real gateway helper.
+        # Leaving it makes Claude Code shell out to `databricks auth token` on a TTL
+        # and hand a live OAuth token to a loopback server that only discards it.
+        if relayed or oss_shim_base_url:
             merged.pop("apiKeyHelper", None)
         if tracing_env_vars and stop_hook_command:
             _upsert_tracing_stop_hook(merged, stop_hook_command)
@@ -825,6 +875,22 @@ def write_tool_config(
         lambda base: _compose(base, enforce_model_default_hierarchy=provider is None),
         managed_file_keys,
         relayed,
+        # NOT just `bool(oss_shim_base_url)`: the pre-launch call from
+        # `configure_tool` runs before the shim's port exists, so
+        # `oss_shim_base_url` is None there even though this write is still part
+        # of an OSS-fallback session. render_overlay/`_compose`'s apiKeyHelper pop
+        # both key on the literal `oss_shim_base_url` value instead — which is
+        # fine there, since that first write's private-file content is fully
+        # overwritten moments later by `_launch_oss_shim`'s own call. The managed
+        # file gets no such second chance (this call is the ONLY one that ever
+        # touches it while in OSS-fallback mode, precisely because it's the one
+        # NOT gated on `oss_shim_base_url` alone) — so it has to get this right
+        # on the very first write, or a stale conflict written here survives
+        # every subsequent `ucode revert` + `ug claude` cycle indefinitely
+        # (live-reproduced: revert clears the file, the next launch's pre-launch
+        # write recreates the identical conflict before ever reaching
+        # `_launch_oss_shim`, which only skips — never repairs — this file).
+        oss_shim=bool(oss_shim_base_url) or bool(state.get("claude_oss_fallback")),
     )
 
     if web_search_model:
@@ -848,6 +914,27 @@ def write_tool_config(
     else:
         state.pop("claude_relayed", None)
         state.pop("relayed_proxy_port", None)
+    # claude_oss_fallback is only ever recomputed by configure_shared_state's
+    # full discovery — a provider/managed-config launch skips that discovery
+    # (skip_model_discovery), so a workspace that once had no Claude models
+    # would otherwise carry a stale claude_oss_fallback=True forever, and
+    # claude.launch() would silently dispatch to _launch_oss_shim (clobbering
+    # the provider/managed settings.json we just wrote) instead of using it.
+    # A provider, a relay, a real model — resolved, managed, or custom — or a
+    # managed config's own per-family pins (coding_agent_config_defaults, which
+    # a manifest can supply without also setting default_model) standing in
+    # here means this write is NOT the OSS shim's own (that call, from
+    # _launch_oss_shim, passes none of these — only oss_shim_base_url and
+    # provider_models), so it's safe and correct to drop the stale flag.
+    if oss_shim_base_url is None and (
+        provider
+        or relayed
+        or model
+        or route_root_model
+        or custom_model
+        or coding_agent_config_defaults
+    ):
+        state.pop("claude_oss_fallback", None)
     state = mark_tool_managed(state, "claude", managed_keys)
     save_state(state)
     return state
@@ -906,6 +993,7 @@ def _reconcile_managed_settings(
     compose: Callable[[dict], dict],
     owned_paths: list[list[str]],
     relayed: bool,
+    oss_shim: bool = False,
 ) -> None:
     """Reconcile Claude Code's OS-managed settings so a bare ``claude`` uses the gateway.
 
@@ -918,6 +1006,26 @@ def _reconcile_managed_settings(
 
     Relayed launches are skipped: they depend on a per-session loopback refresh proxy that only runs
     during `ucode claude`, so a bare `claude` could not reach the gateway anyway.
+
+    OSS-shim launches (``oss_shim``, i.e. ``write_tool_config`` was given an
+    ``oss_shim_base_url``) are skipped for exactly the same reason: the translation shim's loopback
+    server is only started inside `_launch_oss_shim`, and on a fresh random port each launch (see
+    `make_server`'s ``port=0``). Mirroring it would rewrite the root-owned file on every launch
+    (a sudo prompt each time), hard-fail non-interactive launches once the recorded port went
+    stale (`managed_file_conflicts`), and leave a dead loopback URL in the highest-precedence
+    scope pointing every subsequent bare `claude` at nothing. Skipping also keeps
+    `_enforce_model_default_hierarchy` off this path, where `state["claude_models"]` is empty by
+    definition and it would otherwise preserve stale Claude ids instead of the OSS tier pins.
+
+    Skipping the write does not mean the managed file can't still break this launch: a genuine
+    (non-loopback) `apiKeyHelper`/`env.ANTHROPIC_BASE_URL`/`env.ANTHROPIC_CUSTOM_HEADERS` already
+    sitting there — the highest-precedence scope — wins over both the per-launch settings file and
+    the shim's own loopback URL in the process environment. Confirmed live: with such an entry
+    present, Claude Code sent requests straight to the real Anthropic gateway route with an OSS
+    model id, which the gateway correctly 400s (`API type 'anthropic/v1/messages' is not supported
+    by '<model>'`) — a working shim with a broken session on top of it, discovered only mid-turn.
+    So, like relayed, the OSS-shim branch checks `_managed_relayed_conflicts` before skipping and
+    fails fast at configure time instead.
     """
     path = _managed_settings_path()
     if path is None:
@@ -931,6 +1039,22 @@ def _reconcile_managed_settings(
             f"Refusing to use Claude Code managed settings through symlink {path}. Replace it "
             "with a regular file or contact your administrator."
         )
+    if oss_shim and not relayed:
+        conflicts = _managed_relayed_conflicts(path)
+        if conflicts:
+            raise RuntimeError(
+                "Claude Code cannot reach the Databricks OSS-model shim because enterprise "
+                f"managed settings define {', '.join(conflicts)} at {path}. Those keys take "
+                "precedence over both the per-launch settings file and the shim's own loopback "
+                "URL in the process environment, so requests go straight to the real Anthropic "
+                "gateway route instead of being translated — Claude Code sends OSS model ids "
+                "there and the gateway rejects them (`API type 'anthropic/v1/messages' is not "
+                "supported by '<model>'`). Ask your administrator to remove those entries, or "
+                "if ucode previously created them, run `ucode revert` from an interactive "
+                "terminal first."
+            )
+        mark_managed_file_verified(state, "claude", path, scope=OSS_SHIM_MANAGED_SCOPE)
+        return
     if relayed:
         conflicts = _managed_relayed_conflicts(path)
         if conflicts:
@@ -940,7 +1064,7 @@ def _reconcile_managed_settings(
                 "those entries or use standard Databricks authentication. If ucode previously "
                 "created them, run `ucode revert` from an interactive terminal first."
             )
-        mark_managed_file_verified(state, "claude", path, scope="relay-compatible")
+        mark_managed_file_verified(state, "claude", path, scope=RELAY_MANAGED_SCOPE)
         return
 
     current_text = read_managed_file(path)
@@ -1435,6 +1559,166 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     raise SystemExit(returncode)
 
 
+# Re-exported: also used by claude_oss/server.py to echo the same suffixed
+# name back in each response's `model` field, not just at launch — see
+# `ucode.databricks.oss_model_name`'s docstring for why both call sites matter.
+_oss_model_name = oss_model_name
+
+
+def _assign_oss_model_tiers(oss_models: list[str]) -> tuple[str, str, str]:
+    """Pick which OSS model backs each of Claude Code's 3 picker tiers.
+
+    Claude Code's `/model` picker only ever shows 3 rows (Opus/Sonnet/Haiku) —
+    native gateway discovery (`claude_oss/server.py`'s `/v1/models` route)
+    cannot add more, because Claude Code's own discovery parser only
+    recognizes ids matching a known Claude-family pattern and silently drops
+    anything else (live-confirmed: a real GLM/Kimi catalogue reports "0 custom
+    options", a Claude-shaped id reports "1"). So with 3 rows and up to 6
+    models on a workspace like this one (glm-5-2, glm-5-3, glm-5-3-flash,
+    inkling, kimi-k2-7-code, kimi-k3), the assignment has to make a choice
+    rather than discover one:
+
+      Opus   = the newest Kimi (the flagship reasoning model)
+      Sonnet = the newest "quality" GLM (excludes any "flash" sibling)
+      Haiku  = the newest "flash" GLM (falls back to the quality GLM if the
+               workspace has no flash variant at all)
+
+    This uses all 3 tiers for 3 distinct models, unlike the previous scheme,
+    which pinned the same "newest GLM" to both Opus and Haiku and never
+    surfaced Kimi's flagship tier at all."""
+    glm_candidates = [m for m in oss_models if "glm" in m]
+    glm_flash = newest([m for m in glm_candidates if "flash" in m], "glm")
+    glm_quality = newest([m for m in glm_candidates if "flash" not in m], "glm")
+    kimi = newest(oss_models, "kimi")
+
+    fallback = glm_quality or glm_flash or kimi or oss_models[0]
+    opus = kimi or fallback
+    sonnet = glm_quality or glm_flash or fallback
+    haiku = glm_flash or glm_quality or fallback
+    return opus, sonnet, haiku
+
+
+def _launch_oss_shim(state: dict, binary: str, tool_args: list[str]) -> None:
+    """OSS-model launch: the workspace has no Claude models but does have OSS
+    chat models (GLM, Kimi, ...) on the mlflow gateway route. Start the local
+    Anthropic<->OpenAI translation shim (`ucode.agents.claude_oss`), then run
+    Claude Code alongside it — the shim must outlive the exec, so we
+    spawn-and-wait rather than replacing the process, same as `_launch_relayed`.
+    """
+    workspace = state["workspace"]
+    profile = state.get("profile")
+    oss_models: list[str] = state.get("oss_models") or []
+    if not oss_models:
+        # `claude_oss_fallback` and `oss_models` are separate state keys, so a
+        # state with the flag set but an empty/missing model list is reachable
+        # (state persisted by an older build, or a path that recomputes one
+        # but not the other) — fail explicitly here rather than falling
+        # through to `_assign_oss_model_tiers`'s `oss_models[0]`, which raises
+        # an uncaught IndexError that `_launch_tool` doesn't handle (it only
+        # catches RuntimeError).
+        raise RuntimeError(
+            "No models available for claude: the OSS fallback is enabled but no OSS "
+            "models are recorded. Run `ucode configure` to refresh model discovery."
+        )
+
+    opus, sonnet, haiku = _assign_oss_model_tiers(oss_models)
+    default = opus
+
+    tokens = gateway_proxy.TokenCache(workspace, profile)
+    router = ModelRouter(oss_models, default)
+    server = make_server(workspace, tokens, router)
+    bound_port = server.server_address[1]
+
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    refresher = threading.Thread(target=tokens.run_refresher, daemon=True)
+    refresher.start()
+
+    base_url = f"http://{LOOPBACK_HOST}:{bound_port}"
+    opus_model = _oss_model_name(opus)
+    sonnet_model = _oss_model_name(sonnet)
+    haiku_model = _oss_model_name(haiku)
+
+    write_tool_config(
+        state,
+        None,
+        provider_models={
+            "opus": opus_model,
+            "sonnet": sonnet_model,
+            "haiku": haiku_model,
+        },
+        oss_shim_base_url=base_url,
+    )
+
+    # write_tool_config's settings.json is what Claude Code reads for these
+    # values in the common case, but here we also pass them directly as
+    # process env: the child must never fall back to talking to the real
+    # Anthropic API, so ANTHROPIC_BASE_URL (and the model pins that make
+    # in-session /model switching resolve to real Databricks ids) are
+    # guaranteed present on the subprocess regardless of settings-file state.
+    #
+    # ANTHROPIC_BASE_URL redirection is the ONLY thing this launch mode relies on
+    # to guarantee every request goes through the shim, so anything inherited
+    # from the parent environment that could make Claude Code route around it —
+    # a real Anthropic credential, or a native Bedrock/Vertex routing flag — is
+    # filtered out while building `env`, rather than popped afterward (the
+    # latter reads the same but confuses ty's overload resolution on the
+    # subprocess.Popen call below). The session would otherwise still show the
+    # OSS model id as "selected" while actually talking to real
+    # Anthropic/Bedrock/Vertex. Mirrors the equivalent strip in the source this
+    # launch mode was ported from (SafetyCulture/experimental#474).
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key
+        not in (
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_ENTRYPOINT",
+        )
+    }
+    env.update(
+        {
+            "ANTHROPIC_BASE_URL": base_url,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": opus_model,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": sonnet_model,
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": haiku_model,
+            # Always on for OSS-fallback, unlike the opt-in --enable-model-discovery
+            # flag on the normal (non-shim) Claude path: the shim's own /v1/models
+            # route (Handler.do_GET) exists specifically to serve this, so there is
+            # no reason to hide the full GLM/Kimi/... catalogue behind a flag when
+            # the shim is already running and translating every request anyway.
+            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+            # Live-reproduced (Claude Code's own debug log): "[gatewayDiscovery]
+            # skipped: no credential (ANTHROPIC_AUTH_TOKEN, apiKeyHelper, or API
+            # key)" - the discovery flag above is necessary but not sufficient.
+            # Claude Code also requires one of those three credential mechanisms
+            # to be present before it will call /v1/models at all, and this
+            # launch mode deliberately configures none of them for real (no
+            # apiKeyHelper is written, and a real ANTHROPIC_API_KEY is stripped
+            # above). A placeholder costs nothing: the shim never reads the
+            # incoming Authorization header - `_open_upstream` builds its own
+            # from the workspace token cache - so whatever Claude Code sends
+            # here is discarded either way.
+            "ANTHROPIC_AUTH_TOKEN": "ucode-oss-shim-placeholder",
+        }
+    )
+
+    proc = subprocess.Popen(_build_claude_argv(binary, tool_args), env=env)
+    try:
+        returncode = proc.wait()
+    except KeyboardInterrupt:
+        proc.send_signal(signal.SIGINT)
+        returncode = proc.wait()
+    finally:
+        tokens.stop()
+        server.shutdown()
+        server.server_close()
+    raise SystemExit(returncode)
+
+
 def launch(
     state: dict,
     tool_args: list[str],
@@ -1450,7 +1734,10 @@ def launch(
     if state.get("claude_relayed"):
         _launch_relayed(state, binary, tool_args)
         return
-    # Smart routing needs Unix PTY support, which Windows does not provide.
+    if state.get("claude_oss_fallback"):
+        _launch_oss_shim(state, binary, tool_args)
+        return
+    # Smart routing v2 needs Unix PTY support, which Windows does not provide.
     if options.launch_smart_routing and os.name == "nt":
         raise RuntimeError(
             "Smart routing in Claude Code is currently not supported on Windows. "
@@ -1485,3 +1772,13 @@ def validate_cmd(binary: str) -> list[str]:
         "--max-turns",
         "1",
     ]
+
+
+def skip_validation(state: dict) -> bool:
+    """Relayed configs can't be probed with a live message: the loopback proxy
+    and subscription login are only established at launch, so a validation-time
+    request has nothing listening and would hang (and burn subscription quota).
+    The OSS shim has the same property — its loopback server is only started
+    inside `_launch_oss_shim`, at launch time — so claude_oss_fallback skips
+    validation too."""
+    return bool(state.get("claude_relayed")) or bool(state.get("claude_oss_fallback"))

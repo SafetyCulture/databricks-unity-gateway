@@ -67,19 +67,6 @@ jobs:
       # See the test job: hosted runners can't reach the internal pypi-proxy,
       # so resolve against public PyPI (paired with the `uv lock` step below).
       UV_INDEX_URL: https://pypi.org/simple
-      UCODE_TEST_WORKSPACE: ${{ secrets.UCODE_TEST_WORKSPACE }}
-      DATABRICKS_HOST: ${{ secrets.UCODE_TEST_WORKSPACE }}
-      # DATABRICKS_BEARER is the CI escape hatch: `databricks auth token`
-      # only retrieves cached user-OAuth tokens, so on a hosted runner
-      # (no databrickscfg, no cached login) it can never produce a bearer.
-      # Pre-fetch one (e.g. via M2M OAuth client_credentials against
-      # /oidc/v1/token) and store it as a repo secret. Both
-      # has_valid_databricks_auth + get_databricks_token + the agents'
-      # apiKeyHelper short-circuit to this value when set. Tokens are
-      # short-lived (~1h); rotate when CI starts failing with 401s.
-      DATABRICKS_BEARER: ${{ secrets.DATABRICKS_BEARER }}
-      # Subscription OAuth token for the relayed-launch e2e test; the test skips when unset.
-      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       AGENT_PACKAGE: ${{ matrix.package }}
       TEST_KEYWORD: ${{ matrix.keyword }}
     steps:
@@ -92,11 +79,30 @@ jobs:
         run: npm install -g "$AGENT_PACKAGE"
       - run: uv lock
       - run: uv tool install .
+      # Credentials live only on the two test steps below, not on checkout,
+      # npm install, uv lock, or uv tool install — none of that setup reads
+      # them, and each one is a wider process/dependency surface than the
+      # test run that actually needs the token.
+      #
       # Redirect stdin so any interactive `databricks auth login --no-browser`
       # fallback EOFs instead of hanging the runner. With DATABRICKS_BEARER
       # set, the auth code path doesn't shell out at all — this is a safety
       # net for any code path we may have missed.
       - run: uv run pytest tests/test_e2e.py -v -k "$TEST_KEYWORD" < /dev/null
+        env:
+          UCODE_TEST_WORKSPACE: ${{ secrets.UCODE_TEST_WORKSPACE }}
+          DATABRICKS_HOST: ${{ secrets.UCODE_TEST_WORKSPACE }}
+          # DATABRICKS_BEARER is the CI escape hatch: `databricks auth token`
+          # only retrieves cached user-OAuth tokens, so on a hosted runner
+          # (no databrickscfg, no cached login) it can never produce a bearer.
+          # Pre-fetch one (e.g. via M2M OAuth client_credentials against
+          # /oidc/v1/token) and store it as a repo secret. Both
+          # has_valid_databricks_auth + get_databricks_token + the agents'
+          # apiKeyHelper short-circuit to this value when set. Tokens are
+          # short-lived (~1h); rotate when CI starts failing with 401s.
+          DATABRICKS_BEARER: ${{ secrets.DATABRICKS_BEARER }}
+          # Subscription OAuth token for the relayed-launch e2e test; the test skips when unset.
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       # MLflow tracing e2e lives in its own file and needs the `tracing`
       # extra so `import mlflow` resolves (otherwise the test importorskips
       # and silently passes as skipped). `!cancelled()` lets this run even
@@ -104,6 +110,10 @@ jobs:
       # independent and one shouldn't mask the other.
       - if: ${{ !cancelled() && matrix.group == 'claude' }}
         run: uv run --extra tracing pytest tests/test_e2e_tracing.py -v < /dev/null
+        env:
+          UCODE_TEST_WORKSPACE: ${{ secrets.UCODE_TEST_WORKSPACE }}
+          DATABRICKS_HOST: ${{ secrets.UCODE_TEST_WORKSPACE }}
+          DATABRICKS_BEARER: ${{ secrets.DATABRICKS_BEARER }}
 
   e2e:
     name: All agent tests

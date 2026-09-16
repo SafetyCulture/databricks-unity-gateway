@@ -413,6 +413,28 @@ class TestCodexWriteConfig:
         assert provider["base_url"] == f"{WS}/ai-gateway/codex/v1"
         assert provider["wire_api"] == "responses"
 
+    def test_legacy_write_and_launch_agree_on_codex_home(self, tmp_path, monkeypatch):
+        """Old Codex (`--profile ucode`) reads `$CODEX_HOME/config.toml` when
+        CODEX_HOME is set - `write_tool_config`'s legacy branch must write
+        there too, or the generated Databricks provider config never reaches
+        the Codex process launch() execs."""
+        codex_home = tmp_path / "custom-codex-home"
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        # These would be the wrong place to write to under a custom CODEX_HOME;
+        # left pointed at the default location precisely to prove the write
+        # goes to codex_home instead, not here.
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", tmp_path / "unused" / "ucode.config.toml")
+        monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", tmp_path / "unused-backup.toml")
+        monkeypatch.setattr(codex, "LEGACY_CODEX_BACKUP_PATH", tmp_path / "unused-legacy.toml")
+        monkeypatch.setattr(codex, "agent_version", lambda binary: "0.133.0")
+        monkeypatch.setattr(codex, "save_state", lambda state: None)
+
+        codex.write_tool_config({"workspace": WS, "codex_models": ["gpt-5"]})
+
+        doc = read_toml_safe(codex_home / "config.toml")
+        assert doc["profile"] == "ucode"
+        assert doc["profiles"]["ucode"]["model_provider"] == codex.CODEX_MODEL_PROVIDER_NAME
+
     def test_config_write_does_not_persist_smart_routing_hooks(self, tmp_path, monkeypatch):
         config_path = tmp_path / ".codex" / "ucode.config.toml"
         config_path.parent.mkdir()
