@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -449,6 +450,29 @@ def _upstream_message(exc: urllib.error.HTTPError) -> str:
     return raw.strip()[:2000]
 
 
+class _ShimHTTPServer(ThreadingHTTPServer):
+    """Suppresses the default traceback print for a client disconnecting,
+    wherever in the request lifecycle it happens.
+
+    Live-reproduced twice, in two distinct call paths neither
+    `_send_json`/`_stream`'s own disconnect handling can reach: once writing
+    a response (fixed at those call sites directly), and once inside
+    `BaseHTTPRequestHandler`'s own `handle_one_request` reading the NEXT
+    request line on a keep-alive connection the client already reset -
+    entirely before any of our own handler code runs. Rather than patch a
+    third (or fourth, or fifth) specific internal call site, catch the
+    whole class here: every unhandled exception in a request thread passes
+    through this one method before `ThreadingMixIn` prints anything.
+    Anything that isn't a disconnect still prints normally, so a genuine
+    bug stays visible."""
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        exc_type = sys.exc_info()[0]
+        if exc_type is not None and issubclass(exc_type, (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def make_server(
     host: str,
     tokens: Any,
@@ -471,8 +495,8 @@ def make_server(
         },
     )
     try:
-        return ThreadingHTTPServer((LOOPBACK_HOST, port), handler)
+        return _ShimHTTPServer((LOOPBACK_HOST, port), handler)
     except OSError:
         # Requested port is taken (a stale shim from a killed session still
         # holding the socket) — let the OS pick one; the caller reads it back.
-        return ThreadingHTTPServer((LOOPBACK_HOST, 0), handler)
+        return _ShimHTTPServer((LOOPBACK_HOST, 0), handler)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -689,3 +690,52 @@ class TestStreamClientDisconnect(unittest.TestCase):
         handler = self._handler(_ResetImmediately(), upstream)
         handler._stream({}, "model")
         self.assertTrue(upstream.closed)
+
+
+class TestServerSuppressesClientDisconnectTracebacks(unittest.TestCase):
+    """Live-reproduced: a client (Claude Code) resetting a keep-alive
+    connection BETWEEN requests fails inside socketserver's own
+    request-reading loop -
+
+        handle_one_request -> self.rfile.readline(65537) -> recv_into
+        -> ConnectionResetError
+
+    - entirely inside BaseHTTPRequestHandler's own internals, before
+    do_GET/do_POST/_send_json/_stream ever run. Those methods' own
+    disconnect handling (TestSendJsonClientDisconnect,
+    TestStreamClientDisconnect) can't reach this: it's a second, distinct
+    call path to the exact same class of bug (a raw traceback dumped into
+    the user's terminal by socketserver's default handle_error). Fixed at
+    the server level instead of patching a third specific call site, since
+    there's no way to enumerate every internal read/write socketserver
+    might do."""
+
+    def _server(self):
+        router = ModelRouter(["databricks-glm-5-2"], "databricks-glm-5-2")
+        server = make_server("http://127.0.0.1:1", object(), router)
+        self.addCleanup(server.server_close)
+        return server
+
+    def _handle_error_output(self, exc: BaseException) -> str:
+        server = self._server()
+        buf = io.StringIO()
+        try:
+            raise exc
+        except type(exc):
+            with contextlib.redirect_stderr(buf):
+                server.handle_error(None, ("127.0.0.1", 0))
+        return buf.getvalue()
+
+    def test_swallows_connection_reset_with_no_traceback_printed(self):
+        output = self._handle_error_output(ConnectionResetError(54, "Connection reset by peer"))
+        self.assertEqual(output, "")
+
+    def test_swallows_broken_pipe_with_no_traceback_printed(self):
+        output = self._handle_error_output(BrokenPipeError(32, "Broken pipe"))
+        self.assertEqual(output, "")
+
+    def test_a_genuinely_different_exception_still_prints(self):
+        """Must not become a blanket exception suppressor - a real bug has to
+        stay visible rather than vanish into this same safety net."""
+        output = self._handle_error_output(ValueError("a real bug"))
+        self.assertIn("ValueError", output)
