@@ -433,7 +433,7 @@ class TestCodexWriteConfig:
 
         doc = read_toml_safe(codex_home / "config.toml")
         assert doc["profile"] == "ucode"
-        assert doc["profiles"]["ucode"]["model_provider"] == "ucode-databricks"
+        assert doc["profiles"]["ucode"]["model_provider"] == codex.CODEX_MODEL_PROVIDER_NAME
 
     def test_config_write_does_not_persist_smart_routing_hooks(self, tmp_path, monkeypatch):
         config_path = tmp_path / ".codex" / "ucode.config.toml"
