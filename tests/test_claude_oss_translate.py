@@ -531,6 +531,38 @@ class TestStreamTranslation(unittest.TestCase):
         indices = [p["index"] for n, p in events if n == "content_block_start"]
         self.assertEqual(indices, [0, 1])
 
+    def test_a_single_chunk_carrying_both_content_and_a_tool_call_does_not_overlap(self):
+        """A model can emit content and a tool_call's opening fields in the
+        same OpenAI delta chunk. `feed` used to handle tool_calls before text,
+        so `_feed_tool_call` would open a tool block, then `_feed_text` would
+        open a text block on top of it (neither closes the other in that
+        order) - two simultaneously-open content blocks, which Anthropic's
+        protocol (and Claude Code's SSE parser) forbids."""
+        translator = translate.StreamTranslator(model="m")
+        events = drain(
+            translator,
+            [
+                self.chunk(
+                    {
+                        "content": "Let me look.",
+                        "tool_calls": [{"index": 0, "id": "c1", "function": {"name": "Read"}}],
+                    }
+                ),
+                self.chunk(finish="tool_calls"),
+            ],
+        )
+        # Every content_block_start must be matched by a content_block_stop
+        # before the NEXT content_block_start - no two blocks open at once.
+        open_index = None
+        for name, payload in events:
+            if name == "content_block_start":
+                self.assertIsNone(open_index, "a second block opened before the first one closed")
+                open_index = payload["index"]
+            elif name == "content_block_stop":
+                self.assertEqual(payload["index"], open_index)
+                open_index = None
+        self.assertIsNone(open_index, "a block was left open at the end of the stream")
+
     def test_every_opened_block_is_closed(self):
         translator = translate.StreamTranslator(model="m")
         events = drain(

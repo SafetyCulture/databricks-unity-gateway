@@ -1305,6 +1305,27 @@ class TestWriteToolConfigManagedSettings:
 
         assert managed_writes == []
 
+    def test_relayed_rejects_a_non_string_managed_base_url(self, monkeypatch):
+        """A number or object in `env.ANTHROPIC_BASE_URL` must not raise
+        AttributeError from `base_url.startswith(...)` - the managed file is
+        admin-authored, external input, and this function's documented
+        contract is a RuntimeError naming the conflict, not an unhandled
+        crash that skips the actionable "repair the file or contact your
+        administrator" message."""
+        private_writes: list = []
+        managed_writes: list = []
+        self._patch(monkeypatch, private_writes, managed_writes)
+        monkeypatch.setattr(
+            claude, "read_managed_file", lambda path: '{"env": {"ANTHROPIC_BASE_URL": 12345}}'
+        )
+        monkeypatch.setattr(claude, "relayed_proxy_base_url", lambda state: "http://127.0.0.1:9999")
+        state = {"workspace": WS, "codex_models": []}
+
+        with pytest.raises(RuntimeError, match="run `ucode revert`"):
+            claude.write_tool_config(state, "databricks-claude-sonnet-4", relayed=True)
+
+        assert managed_writes == []
+
     def test_noninteractive_uses_local_settings_when_managed_file_is_compatible(self, monkeypatch):
         private_writes: list = []
         managed_writes: list = []
@@ -1733,6 +1754,19 @@ class TestClaudeLaunch:
             False,
         )
         assert calls[-3:] == [("stop",), ("shutdown",), ("close",)]
+
+    def test_launch_oss_shim_fails_explicitly_when_there_are_no_oss_models(self, monkeypatch):
+        """`claude_oss_fallback` and `oss_models` are separate state keys, so a
+        state that has the flag but an empty/missing model list is reachable
+        (e.g. state persisted by an older build, or a path that recomputes one
+        but not the other). Without this guard, `_assign_oss_model_tiers`
+        falls through to `oss_models[0]` and crashes with an IndexError that
+        `_launch_tool` doesn't catch (it only catches RuntimeError) - a
+        confusing crash instead of the intended "no models available" error."""
+        state = {"workspace": "https://example.cloud.databricks.com", "oss_models": []}
+
+        with pytest.raises(RuntimeError, match="no OSS models"):
+            claude._launch_oss_shim(state, "claude", [])
 
     def test_launch_oss_shim_starts_the_server_and_runs_claude_against_it(
         self, monkeypatch, tmp_path

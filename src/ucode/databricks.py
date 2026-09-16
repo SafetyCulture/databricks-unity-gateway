@@ -1152,6 +1152,18 @@ def ensure_databricks_auth(
     run_databricks_login(workspace, profile)
 
 
+def _command_executable_name(command: str) -> str:
+    """The bearer command's executable name only — never the full command
+    line, which commonly carries a credential argument (e.g. `broker
+    --api-key <secret>`) that must not reach a RuntimeError's text, and from
+    there stderr/CI logs. Splits on whitespace rather than reusing the
+    already-parsed argv: that parse can fail (or, on Windows, is never a
+    list at all) before an executable name is available, and this must work
+    either way."""
+    stripped = command.strip()
+    return stripped.split(None, 1)[0] if stripped else "(empty command)"
+
+
 def _bearer_from_command(command: str) -> str:
     """Run ``DATABRICKS_BEARER_COMMAND`` and return the bearer it prints.
 
@@ -1160,6 +1172,7 @@ def _bearer_from_command(command: str) -> str:
     would report a misleading stale-login error instead of the real cause.
     Mirrors how ``auth-token --use-pat`` fails closed for the same reason."""
     _debug("get_databricks_token", "using DATABRICKS_BEARER_COMMAND")
+    executable = _command_executable_name(command)
     try:
         # Windows takes the command line as one string and lets CreateProcess
         # split it: shlex's POSIX rules would eat the backslashes in `C:\...`,
@@ -1176,7 +1189,7 @@ def _bearer_from_command(command: str) -> str:
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         raise RuntimeError(
             f"DATABRICKS_BEARER_COMMAND could not be run: {type(exc).__name__}: {exc}. "
-            f"Command: {command}"
+            f"Command: {executable}"
         ) from exc
     # Deliberately not _format_subprocess_result: that includes stdout on a
     # non-zero exit, and this command's stdout is the bearer itself.
@@ -1189,7 +1202,7 @@ def _bearer_from_command(command: str) -> str:
     # diagnostic, not a bearer, and forwarding it only resurfaces as a 401.
     reason = f"exited {result.returncode}" if result.returncode else "printed no token"
     detail = f" Stderr: {stderr}" if stderr else ""
-    raise RuntimeError(f"DATABRICKS_BEARER_COMMAND {reason}. Command: {command}.{detail}")
+    raise RuntimeError(f"DATABRICKS_BEARER_COMMAND {reason}. Command: {executable}.{detail}")
 
 
 def get_databricks_token(
@@ -1352,13 +1365,19 @@ def _looks_like_cli_permission_error(stderr: str | None) -> bool:
     """Whether a Databricks CLI stderr indicates an authorization failure.
 
     The CLI exit code is generic, so we match on the stable markers the CLI/API emit
-    for a denied workspace call rather than the status alone."""
+    for a denied workspace call rather than the status alone.
+
+    Deliberately does NOT match a bare "unauthorized": a short-lived OAuth
+    token expiring reports `401 Unauthorized`, which is an authentication
+    failure needing re-login, not a permission denial. Classifying it as
+    PermissionDeniedError makes `_discover_mcp_source` silently skip the
+    source instead of surfacing the real cause."""
     if not stderr:
         return False
     lowered = stderr.lower()
     if "permission" in lowered and ("denied" in lowered or "insufficient" in lowered):
         return True
-    return "403" in lowered or "not authorized" in lowered or "unauthorized" in lowered
+    return "403" in lowered or "not authorized" in lowered
 
 
 def list_databricks_apps(workspace: str, profile: str | None = None) -> list[dict]:
@@ -1647,13 +1666,30 @@ def oss_model_name(model: str) -> str:
     return model
 
 
+def _digit_runs(model: str) -> tuple[int, ...]:
+    """Every run of digits in `model`, as ints, in order.
+
+    `glm-5-9` -> (5, 9); `kimi-k3` -> (3,); `kimi-k2-7-code` -> (2, 7).
+    Deliberately not `model_version_sort_key` (used elsewhere for cleanly
+    dash-separated versions like `gemini-3-5-flash`): that key only extracts
+    a version from a token that is ENTIRELY digits, so it never sees the `3`
+    in `k3` at all and would rank `kimi-k2-7-code` as newer than `kimi-k3` on
+    this real workspace's actual catalogue — a real regression, not just a
+    hypothetical one."""
+    return tuple(int(run) for run in re.findall(r"\d+", model))
+
+
 def newest(models: list[str], family: str) -> str | None:
     """Pick the highest-versioned model in `family` from a discovered model list.
 
-    Ids embed their version in the name (`glm-5-2`, `kimi-k3`), so a reverse
-    lexicographic sort is enough to prefer the newest — same approach as
-    SafetyCulture/experimental#474's `dbxclaude.databricks.newest`."""
-    matches = sorted((m for m in models if family in m), reverse=True)
+    Compares every embedded digit run numerically (see `_digit_runs`), tied
+    broken by the raw string for stability — plain reverse-lexicographic
+    string sort (the original approach, matching
+    SafetyCulture/experimental#474's `dbxclaude.databricks.newest`) ranks
+    `glm-5-9` above `glm-5-10` because `'9' > '1'` as characters."""
+    matches = sorted(
+        (m for m in models if family in m), key=lambda m: (_digit_runs(m), m), reverse=True
+    )
     return matches[0] if matches else None
 
 

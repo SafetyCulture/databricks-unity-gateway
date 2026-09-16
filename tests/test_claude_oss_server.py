@@ -633,3 +633,59 @@ class TestSendJsonClientDisconnect(unittest.TestCase):
 
         handler = _bare_handler(_ResetOnBody())
         handler._send_json(200, {"ok": True})
+
+
+class _FakeUpstreamResponse:
+    """Stands in for what `_upstream` returns: an iterable, context-managed
+    response whose SSE lines `_stream` reads."""
+
+    def __init__(self, lines=()):
+        self._lines = list(lines)
+        self.closed = False
+
+    def __iter__(self):
+        return iter(self._lines)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+        return False
+
+    def close(self):
+        self.closed = True
+
+
+class TestStreamClientDisconnect(unittest.TestCase):
+    """`_stream`'s own SSE header setup (send_response/send_header/
+    end_headers) sat OUTSIDE the try block that handles a disconnected
+    client, unlike _send_json (see TestSendJsonClientDisconnect) - the same
+    class of live bug, just in a path that never goes through _send_json at
+    all. A disconnect during end_headers() here would escape _stream
+    entirely, straight into socketserver's default handle_error, and leave
+    the upstream `response` unclosed since `with response:` is never
+    reached."""
+
+    def _handler(self, wfile, upstream_response):
+        handler = _bare_handler(wfile)
+        handler.reasoning = "thinking"
+        handler._upstream = lambda payload, stream: upstream_response
+        return handler
+
+    def test_swallows_broken_pipe_during_sse_header_setup(self):
+        upstream = _FakeUpstreamResponse([])
+        handler = self._handler(_BrokenPipeWriter(), upstream)
+        # Must not raise - a dead client mid-header-setup is routine teardown.
+        handler._stream({}, "model")
+        self.assertTrue(upstream.closed, "the upstream response must not be left open")
+
+    def test_swallows_connection_reset_during_sse_header_setup(self):
+        class _ResetImmediately(io.RawIOBase):
+            def write(self, _data):  # type: ignore[override]
+                raise ConnectionResetError(54, "Connection reset by peer")
+
+        upstream = _FakeUpstreamResponse([])
+        handler = self._handler(_ResetImmediately(), upstream)
+        handler._stream({}, "model")
+        self.assertTrue(upstream.closed)

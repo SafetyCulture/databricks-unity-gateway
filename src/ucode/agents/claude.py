@@ -311,7 +311,13 @@ def _managed_relayed_conflicts(path: Path) -> list[str]:
     env = settings.get("env")
     if isinstance(env, dict):
         base_url = env.get("ANTHROPIC_BASE_URL")
-        if base_url and not base_url.startswith(f"http://{LOOPBACK_HOST}:"):
+        # The managed file is admin-authored, external input — a number or
+        # object here must be treated as a conflict, not crash `.startswith`
+        # with an AttributeError that escapes this function's RuntimeError
+        # contract.
+        if base_url and not (
+            isinstance(base_url, str) and base_url.startswith(f"http://{LOOPBACK_HOST}:")
+        ):
             conflicts.append("env.ANTHROPIC_BASE_URL")
         if env.get("ANTHROPIC_CUSTOM_HEADERS"):
             conflicts.append("env.ANTHROPIC_CUSTOM_HEADERS")
@@ -1602,6 +1608,18 @@ def _launch_oss_shim(state: dict, binary: str, tool_args: list[str]) -> None:
     workspace = state["workspace"]
     profile = state.get("profile")
     oss_models: list[str] = state.get("oss_models") or []
+    if not oss_models:
+        # `claude_oss_fallback` and `oss_models` are separate state keys, so a
+        # state with the flag set but an empty/missing model list is reachable
+        # (state persisted by an older build, or a path that recomputes one
+        # but not the other) — fail explicitly here rather than falling
+        # through to `_assign_oss_model_tiers`'s `oss_models[0]`, which raises
+        # an uncaught IndexError that `_launch_tool` doesn't handle (it only
+        # catches RuntimeError).
+        raise RuntimeError(
+            "No models available for claude: the OSS fallback is enabled but no OSS "
+            "models are recorded. Run `ucode configure` to refresh model discovery."
+        )
 
     opus, sonnet, haiku = _assign_oss_model_tiers(oss_models)
     default = opus

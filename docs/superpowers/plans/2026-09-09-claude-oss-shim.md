@@ -49,17 +49,29 @@ def test_kimi_k3_gets_the_million_token_window(self):
     # kimi-k3 specifically is 1M context (verified against safetyculture-safetyculture-production
     # by SafetyCulture/experimental#478, 2026-08-11), distinct from the general "kimi" family
     # (K2.7 Code, Inkling), which stays at the conservative 128k default.
-    assert db_mod.model_token_limits("databricks-kimi-k3") == {"context": 1_000_000, "output": 65_536}
+    assert db_mod.model_token_limits("databricks-kimi-k3") == {
+        "context": 1_000_000,
+        "output": 65_536,
+    }
+
 
 def test_kimi_k2_7_code_keeps_the_family_default(self):
-    assert db_mod.model_token_limits("databricks-kimi-k2-7-code") == {"context": 128_000, "output": 65_536}
+    assert db_mod.model_token_limits("databricks-kimi-k2-7-code") == {
+        "context": 128_000,
+        "output": 65_536,
+    }
+
 
 def test_glm_output_cap_matches_the_live_workspace_measurement(self):
     # Corrected from PR#420's 25_000/200_000 (measured against a different Databricks
     # workspace) to the value independently confirmed twice against our own workspace
     # (SafetyCulture/experimental#474, 2026-08-05: "I confirmed the output cap exactly by
     # tripping the gateway's rejection").
-    assert db_mod.model_token_limits("databricks-glm-5-2") == {"context": 1_000_000, "output": 65_536}
+    assert db_mod.model_token_limits("databricks-glm-5-2") == {
+        "context": 1_000_000,
+        "output": 65_536,
+    }
+
 
 def test_longest_family_key_wins_regardless_of_dict_order(self):
     # Guards the kimi vs kimi-k3 distinction: a naive first-match-in-iteration-order lookup
@@ -325,7 +337,9 @@ class TestModelRouter(unittest.TestCase):
         self.assertEqual(router.resolve("claude-opus-4-8"), "databricks-glm-5-2")
 
     def test_bare_family_name_resolves_to_the_newest_match(self):
-        router = ModelRouter(["databricks-kimi-k2-7-code", "databricks-kimi-k3"], "databricks-kimi-k3")
+        router = ModelRouter(
+            ["databricks-kimi-k2-7-code", "databricks-kimi-k3"], "databricks-kimi-k3"
+        )
         self.assertEqual(router.resolve("kimi"), "databricks-kimi-k3")
 
     def test_empty_or_non_string_falls_back_to_default(self):
@@ -508,7 +522,11 @@ class TestMessagesEndpoint(unittest.TestCase):
     def test_the_clients_own_authorization_header_is_never_forwarded(self):
         self._post(
             "/v1/messages",
-            {"model": "databricks-glm-5-2", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]},
+            {
+                "model": "databricks-glm-5-2",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
         )
         sent_auth = self.gateway.RequestHandlerClass  # placeholder to keep flake happy
         # The stub records the last request's headers via BaseHTTPRequestHandler.headers,
@@ -695,7 +713,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error(502, f"Databricks gateway unreachable: {exc}")
             return
         self.trace("response", upstream)
-        self._send_json(200, translate.openai_to_anthropic(upstream, model=model, reasoning=self.reasoning))
+        self._send_json(
+            200, translate.openai_to_anthropic(upstream, model=model, reasoning=self.reasoning)
+        )
 
     def _stream(self, payload: dict, model: str) -> None:
         try:
@@ -1159,12 +1179,16 @@ def test_configure_sets_oss_fallback_when_no_claude_models_but_oss_models_exist(
     state = cli.configure_shared_state("https://example.cloud.databricks.com", tools={"claude"})
     assert state["claude_oss_fallback"] is True
 
+
 def test_configure_does_not_set_oss_fallback_when_claude_models_exist(self, monkeypatch):
     monkeypatch.setattr(cli, "discover_model_services", lambda *a, **k: ({}, [], [], [], None))
-    monkeypatch.setattr(cli, "discover_claude_models", lambda *a, **k: ({"opus": "claude-opus-4-8"}, None))
+    monkeypatch.setattr(
+        cli, "discover_claude_models", lambda *a, **k: ({"opus": "claude-opus-4-8"}, None)
+    )
     monkeypatch.setattr(cli, "discover_oss_models", lambda *a, **k: (["databricks-glm-5-2"], None))
     state = cli.configure_shared_state("https://example.cloud.databricks.com", tools={"claude"})
     assert state.get("claude_oss_fallback") is not True
+
 
 def test_configure_does_not_set_oss_fallback_when_no_oss_models_either(self, monkeypatch):
     monkeypatch.setattr(cli, "discover_model_services", lambda *a, **k: ({}, [], [], [], None))

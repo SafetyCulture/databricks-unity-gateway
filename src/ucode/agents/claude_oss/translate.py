@@ -659,14 +659,15 @@ class StreamTranslator:
         if choice.get("finish_reason"):
             self._finish_reason = choice["finish_reason"]
 
-        tool_calls = delta.get("tool_calls")
-        if isinstance(tool_calls, list) and tool_calls:
-            for call in tool_calls:
-                if not isinstance(call, dict):
-                    continue
-                yield from self._feed_tool_call(call)
-
-        # Reasoning is emitted before content, so handle it first.
+        # Reasoning, then text, then tool calls: `_feed_tool_call` already
+        # closes an open thinking or text block before opening its own, so
+        # feeding it last guarantees blocks never overlap even when a single
+        # delta carries both `content`/reasoning and `tool_calls` together -
+        # processing tool_calls first (the previous order) opened the tool
+        # block, then _feed_text/_feed_reasoning opened a SECOND block on top
+        # of it in the same chunk, since neither closes a tool block. Claude
+        # Code's SSE parser (and Anthropic's protocol) requires one block
+        # closed before the next opens.
         thoughts = _reasoning_of(delta)
         if thoughts:
             yield from self._feed_reasoning(thoughts)
@@ -674,6 +675,13 @@ class StreamTranslator:
         text = delta.get("content")
         if isinstance(text, str) and text:
             yield from self._feed_text(text)
+
+        tool_calls = delta.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                yield from self._feed_tool_call(call)
 
     def _feed_tool_call(self, call: dict) -> Iterator[tuple[str, dict]]:
         position = call.get("index")

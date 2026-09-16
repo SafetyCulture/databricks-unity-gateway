@@ -455,6 +455,24 @@ class TestNewest:
     def test_returns_none_when_the_family_has_no_match(self):
         assert db_mod.newest(["databricks-glm-5-2"], "qwen") is None
 
+    def test_sorts_multi_digit_versions_numerically_not_lexicographically(self):
+        # A plain reverse-lexicographic sort ranks "5-9" above "5-10" ('9' >
+        # '1' as characters) - wrong once a family reaches a double-digit
+        # minor version.
+        models = ["databricks-glm-5-9", "databricks-glm-5-10"]
+        assert db_mod.newest(models, "glm") == "databricks-glm-5-10"
+
+    def test_still_prefers_kimi_k3_over_kimi_k2_7_code(self):
+        # Regression guard: `model_version_sort_key` (used elsewhere for
+        # cleanly dash-separated versions like "gemini-3-5-flash") does NOT
+        # extract a version from "k3" - its digit run is embedded after a
+        # letter, not a separate dash token - so naively reusing it here would
+        # rank "kimi-k2-7-code" as newer than "kimi-k3" on this real
+        # workspace's actual catalogue. `newest` must get this right without
+        # that regression.
+        models = ["databricks-kimi-k2-7-code", "databricks-kimi-k3"]
+        assert db_mod.newest(models, "kimi") == "databricks-kimi-k3"
+
 
 class TestSupportsVision:
     def test_kimi_k3_supports_vision(self):
@@ -3570,6 +3588,32 @@ class TestAllUsersCanUseSchema:
         assert "principal=account%20users" in seen["url"]
 
 
+class TestLooksLikeCliPermissionError:
+    """A short-lived OAuth token expiring reports `401 Unauthorized`, not a
+    permission denial — but the substring check used to treat the bare word
+    "unauthorized" as equivalent to "not authorized"/"403", so an expired
+    token got classified as PermissionDeniedError. `_discover_mcp_source`
+    then silently skips the source instead of surfacing a re-authentication
+    error — the caller never learns their session died."""
+
+    def test_401_unauthorized_is_not_a_permission_error(self):
+        assert db_mod._looks_like_cli_permission_error("Error: 401 Unauthorized") is False
+
+    def test_a_genuine_403_still_is(self):
+        assert db_mod._looks_like_cli_permission_error("Error: 403 Forbidden") is True
+
+    def test_permission_denied_wording_still_is(self):
+        assert db_mod._looks_like_cli_permission_error("permission denied") is True
+        assert db_mod._looks_like_cli_permission_error("insufficient permission") is True
+
+    def test_not_authorized_wording_still_is(self):
+        assert db_mod._looks_like_cli_permission_error("you are not authorized") is True
+
+    def test_empty_stderr_is_not_a_permission_error(self):
+        assert db_mod._looks_like_cli_permission_error(None) is False
+        assert db_mod._looks_like_cli_permission_error("") is False
+
+
 class TestBearerCommand:
     """``DATABRICKS_BEARER_COMMAND`` is the command form of the static
     ``DATABRICKS_BEARER`` hatch, for callers whose bearer expires and has to be
@@ -3672,11 +3716,38 @@ class TestBearerCommand:
             get_databricks_token(WS)
         assert not marker.exists()
 
+    def test_does_not_leak_command_arguments_when_the_command_exits_non_zero(
+        self, tmp_path, monkeypatch
+    ):
+        # A broker is commonly invoked with a credential argument (e.g.
+        # `broker --api-key ...`). The command already fails closed for a bad
+        # exit, but the error text itself must not echo that argument back
+        # into stderr/CI logs.
+        broker = self._broker(tmp_path, "exit 7")
+        self._env(tmp_path, monkeypatch, f"{broker} --api-key super-secret-value")
+
+        with pytest.raises(RuntimeError, match="exited 7") as excinfo:
+            get_databricks_token(WS)
+        assert "super-secret-value" not in str(excinfo.value)
+
     def test_reports_an_unrunnable_command(self, tmp_path, monkeypatch):
         self._env(tmp_path, monkeypatch, str(tmp_path / "does-not-exist"))
 
         with pytest.raises(RuntimeError, match="could not be run"):
             get_databricks_token(WS)
+
+    def test_does_not_leak_command_arguments_when_the_command_cannot_run(
+        self, tmp_path, monkeypatch
+    ):
+        self._env(
+            tmp_path,
+            monkeypatch,
+            f"{tmp_path / 'does-not-exist'} --api-key super-secret-value",
+        )
+
+        with pytest.raises(RuntimeError, match="could not be run") as excinfo:
+            get_databricks_token(WS)
+        assert "super-secret-value" not in str(excinfo.value)
 
     def test_static_bearer_still_wins(self, tmp_path, monkeypatch):
         broker = self._broker(tmp_path, 'echo "brokered-token"')

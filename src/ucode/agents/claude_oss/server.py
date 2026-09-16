@@ -374,15 +374,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error(502, f"Databricks gateway unreachable: {exc}")
             return
 
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.close_connection = True
-
         translator = translate.StreamTranslator(model=model, reasoning=self.reasoning)
         try:
+            # Header setup lives INSIDE this try, not before it: a disconnect
+            # during end_headers() is the same class of failure as mid-stream
+            # (live-reproduced for _send_json's success paths, and the same
+            # gap existed here) - left outside, it would escape straight into
+            # socketserver's default handle_error (a raw traceback in the
+            # user's terminal), and `response` would never reach `with
+            # response:` to be closed.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+
             with response:
                 for line in response:
                     text = line.decode("utf-8", "replace").strip()
@@ -401,6 +408,12 @@ class Handler(BaseHTTPRequestHandler):
             for event in translator.finish():
                 self._write_event(*event)
         except (BrokenPipeError, ConnectionResetError):
+            # `with response:` already closed it if we got that far; harmless
+            # (http.client responses tolerate a repeat close) if the
+            # disconnect happened earlier, during header setup, before the
+            # `with` was ever entered.
+            self.close_connection = True
+            response.close()
             return
         except (urllib.error.URLError, OSError) as exc:
             try:
